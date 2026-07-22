@@ -1,4 +1,4 @@
-# MOOP-HealthFL [![DOI](https://zenodo.org/badge/1309172706.svg)](https://doi.org/10.5281/zenodo.21499212)
+# MOOP-HealthFL  [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21499213.svg)](https://doi.org/10.5281/zenodo.21499212)
 
 **Multi-Objective Optimization for Privacy-Preserving Federated Learning on Clinical Data: Balancing Privacy, Utility, Fairness, and Efficiency**
 
