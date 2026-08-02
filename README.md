@@ -1,10 +1,16 @@
-# MOOP-HealthFL  [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21499213.svg)](https://doi.org/10.5281/zenodo.21499212)
+# MOOP-HealthFL
 
-**Multi-Objective Optimization for Privacy-Preserving Federated Learning on Clinical Data: Balancing Privacy, Utility, Fairness, and Efficiency**
+**Certified differential privacy in clinical federated learning: rigorous evaluation and multi-objective privacy-budget selection**
 
-This repository contains the full implementation and evaluation harnesses for the MOOP-HealthFL paper. The framework formulates adaptive per-client differential privacy (DP) budget allocation in healthcare federated learning (FL) as a constrained four-objective Pareto optimization problem — privacy, utility, fairness, efficiency — solved with NSGA-II under clinical safety constraints, with a five-level fairness evaluation (client, group, individual, system, outcome).
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21499213.svg)](https://doi.org/10.5281/zenodo.21499213)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> Citation information will be added upon publication. The repository is anonymized for review.
+This repository contains the full implementation and evaluation harnesses for the MOOP-HealthFL paper. The study rigorously evaluates **certified** differential privacy (per-example DP-SGD with a Rényi-DP accountant calibrating total-training (ε, δ) guarantees) in a simulated five-client clinical federation built from MIMIC-IV, and formulates heterogeneous per-client privacy-budget allocation as a constrained three-objective Pareto search (privacy, utility, fairness) solved with NSGA-II under clinical constraints, with a matched-budget Latin-hypercube random-search control and a five-level fairness evaluation (client, group, individual, system, outcome).
+
+- **Archived release (citable):** https://doi.org/10.5281/zenodo.21499213
+- **Development repository:** https://github.com/babdelkader-phd/moop-healthfl
+
+> Citation details will be completed once the associated paper is published.
 
 ---
 
@@ -12,8 +18,9 @@ This repository contains the full implementation and evaluation harnesses for th
 
 | Path | Contents |
 |---|---|
-| `moop_healthfl.py` | The complete pipeline: MIMIC-IV feature extraction, care-unit federation, DP-FL training (pure-NumPy MLP with optional TensorFlow backend), all seven baselines, NSGA-II search, five-level fairness evaluation, figures |
-| `experiments_extra/` | Complementary harnesses: membership inference attack, bootstrap confidence intervals + worst-group analysis, participation-rate ablation |
+| `moop_healthfl.py` | The complete pipeline: MIMIC-IV feature extraction, patient-level split and patient→client assignment, certified DP-FL training (pure-NumPy MLP with per-example gradients), all ten methods, NSGA-II + LHS searches, five-level fairness evaluation, figures |
+| `dp_core_v5.py` | Certified-DP core: RDP accountant for the Poisson-subsampled Gaussian mechanism, noise calibration by binary search, per-example gradients, clipping/noising, one-hot encoding, uniform validation threshold rule, operating-point metrics |
+| `experiments_extra/` | Complementary harnesses: patient-clustered bootstrap CIs + paired test, membership inference attack, stay-vs-patient split ablation, reduced-round search fidelity, participation-rate ablation |
 | `docs/DATA.md` | Exact data requirements: MIMIC-IV files, item IDs, cohort definition, client partition |
 | `requirements.txt` | Tested dependency set (Python ≥ 3.9) |
 
@@ -26,18 +33,18 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-TensorFlow is optional — without it, the pipeline uses the built-in pure-NumPy MLP (same 3,009-parameter architecture; this is what produced the paper's results).
+TensorFlow is **not** required: certified per-example DP-SGD is implemented in the built-in pure-NumPy backend (19–64–32–1 MLP, 3,393 parameters), which is what produced the paper's results.
 
 ## Getting the data
 
-The experiments use **MIMIC-IV v2.2** (PhysioNet). Access requires:
+The experiments use **MIMIC-IV v3.1** (PhysioNet). Access requires:
 
 1. A [PhysioNet](https://physionet.org/) account with CITI "Data or Specimens Only Research" training,
 2. Signing the MIMIC-IV data use agreement,
 3. Downloading MIMIC-IV so that you have the standard layout:
 
 ```
-/path/to/mimic-iv/
+/path/to/mimic-iv-3.1/
 ├── icu/    icustays.csv.gz, chartevents.csv.gz
 └── hosp/   patients.csv.gz, admissions.csv.gz, labevents.csv.gz
 ```
@@ -47,14 +54,15 @@ Only those five files are read. See [docs/DATA.md](docs/DATA.md) for the exact i
 ## Running the main experiment
 
 ```bash
-# Full paper protocol: 3 seeds (42/123/456), NSGA-II pop=50, gen=50,
-# 15 eval rounds per candidate, 50 full-training rounds.
-python moop_healthfl.py --mimic-path /path/to/mimic-iv --output-dir output
+# Full paper protocol: 3 seeds (42/123/456), 10 methods, NSGA-II pop=50, gen=50,
+# 15 eval rounds per candidate, 50 full-training rounds, certified budgets ε ∈ [1, 10].
+python moop_healthfl.py --mimic-path /path/to/mimic-iv-3.1 --output-dir output
 ```
 
-- **First run** extracts features from the raw CSVs (~15–30 min) and caches them to `output/mimic_iv_features.parquet`; later runs start from the cache in seconds.
+- **First run** extracts features from the raw CSVs (~15–30 min) and caches them to `output/mimic_iv_features_v2.parquet` (the cache retains `subject_id` for the patient-level split); later runs start from the cache in seconds.
 - **Checkpointing**: per-seed, per-method results are checkpointed; interrupted runs resume where they stopped.
-- **Runtime**: the NSGA-II search is the dominant cost — approximately **4–19 hours per seed** on an 8-core machine (population members are evaluated in parallel; use `--n-jobs` to control workers). Baselines take ~3 minutes each.
+- **Runtime**: the NSGA-II search is the dominant cost — approximately **9.5–10 hours per seed** with 15 parallel workers (use `--n-jobs` to control); the complete experiment (10 methods × 3 seeds, including the LHS control) took ≈ 90 hours on a 16-core CPU machine. Individual baselines take minutes.
+- **Noise calibration**: the RDP accountant calibrates each client's noise multiplier once per (ε, sampling rate, step count) so that the *full 50-round protocol* satisfies the client's total (ε, δ = 10⁻⁵) budget at record (ICU-stay) adjacency; calibrations are cached.
 - **Smoke test** (no MIMIC-IV needed — synthetic data fallback, reduced NSGA-II):
 
 ```bash
@@ -67,34 +75,40 @@ Outputs land in `output/`: `results/aggregated_results.json` (all metrics, mean 
 
 ## Running the complementary analyses
 
-These reuse the cached features and evaluate the paper's published seed-42 best-compromise allocation (avg ε = 0.887):
+These reuse the cached features and the main run's checkpoint (they evaluate the reported seed-42 best-compromise allocation), so **run the main experiment first**:
 
 ```bash
-python3 experiments_extra/run_mia_attack.py            # ~1 h  — membership inference (Yeom loss-threshold + confidence)
-python3 experiments_extra/run_bootstrap_ci.py          # ~1 h  — 95% bootstrap CIs, per-group and worst-group metrics
-python3 experiments_extra/run_efficiency_ablation.py   # ~1.5 h — client participation rates 20–100%
+python3 experiments_extra/run_bootstrap_ci.py          # ~1 h    — patient-clustered 95% CIs, paired MOOP-vs-Fixed(1.0) test, per-group / worst-group metrics
+python3 experiments_extra/run_mia_attack.py            # ~1 h    — membership inference (Yeom loss-threshold + confidence), patient-disjoint members/non-members
+python3 experiments_extra/run_split_ablation.py        # ~1–1.5 h — stay-level vs patient-level split (leakage quantification)
+python3 experiments_extra/run_round_fidelity.py        # ~2–3 h  — Spearman fidelity of the 15-round search proxy vs 50-round training
+python3 experiments_extra/run_efficiency_ablation.py   # ~1.5 h  — client participation rates 20–100%
 ```
 
-Results are written to `experiments_extra/results/*.json`. If you used a non-default `--output-dir` for the main run, pass `--cache-file /your/output/mimic_iv_features.parquet`.
+Results are written to `experiments_extra/results/*.json`. If you used a non-default `--output-dir` for the main run, pass `--cache-file /your/output/mimic_iv_features_v2.parquet`. See [experiments_extra/README.md](experiments_extra/README.md) for details, including the privacy-unit note (record-level adjacency; patient-level guarantees would require per-patient clipping).
 
-## Expected results (full protocol, mean ± std over 3 seeds)
+## Expected results (full protocol, mean ± std over 3 seeds, patient-level test split, validation-selected thresholds)
 
-| Method | AUROC | Sensitivity | Avg. ε | Unified fairness loss |
-|---|---|---|---|---|
-| FedAvg (no DP) | 0.781 ± 0.002 | 0.719 ± 0.006 | ∞ | 0.065 |
-| Fixed-ε(1.0) | 0.761 ± 0.001 | 0.698 ± 0.006 | 1.00 | 0.066 |
-| **MOOP-HealthFL** | **0.761 ± 0.001** | 0.695 ± 0.003 | **0.909** | **0.065** |
+| Method | AUROC | AUPRC | Sensitivity | Specificity | PPV | Avg. ε (total) |
+|---|---|---|---|---|---|---|
+| FedAvg (no DP) | 0.773 ± 0.000 | 0.384 | 0.666 | 0.729 | 0.251 | ∞ |
+| Fixed-ε(1.0) | 0.719 ± 0.001 | 0.285 | 0.685 | 0.632 | 0.203 | 1.00 |
+| Fixed-ε(2.0) | 0.731 ± 0.005 | 0.302 | 0.682 | 0.651 | 0.211 | 2.00 |
+| Fixed-ε(10.0) | 0.739 ± 0.001 | 0.316 | 0.684 | 0.671 | 0.221 | 10.00 |
+| LHS-Search | 0.732 ± 0.002 | 0.303 | 0.688 | 0.649 | 0.211 | ≈ 2.5 |
+| **MOOP-HealthFL** | **0.731 ± 0.003** | 0.303 | 0.684 | 0.653 | 0.212 | **≈ 2.5** |
 
-Complementary analyses: membership-inference attack AUC ≈ 0.50 for all methods (no measurable model-level leakage at this scale); bootstrap AUROC CI half-width ≈ 0.010; participation at 20% costs ≈ 0.010 AUROC for an 80% communication reduction.
+Key qualitative findings (see the paper): certified privacy costs 0.034–0.054 AUROC; DP models select decision thresholds ≈ 0.005–0.01 vs ≈ 0.51 non-private, and at matched sensitivity lose 6–10 points of specificity and 4–5 points of PPV; MOOP-HealthFL finds frontier-consistent allocations automatically but does not beat the fixed-budget frontier; fairness differences across methods lie within seed variability. Complementary analyses: membership-inference attack AUC ≈ 0.50 for all methods; stay-level splitting inflates AUROC by ≈ 0.012 and manufactures apparent attainment of the 0.70 sensitivity target.
 
 Exact values vary slightly with hardware/BLAS; the qualitative ordering and all paper conclusions are seed-stable.
 
 ## Reproducibility notes
 
 - Seeds 42, 123, 456 control data splits, model init, DP noise, and NSGA-II.
+- All partitioning is at the **patient** level (70/10/20 by `subject_id`, `RandomState(42)`), and each training patient is assigned to exactly one client (modal care unit) — zero cross-client patient overlap.
 - The federation is **simulated**: MIMIC-IV is partitioned by ICU care unit into five clients (single-source proxy for institutional heterogeneity) — see the paper's threat-to-validity discussion.
-- The global test split (20%, stratified, `random_state=42`) is fixed across all methods and seeds.
-- All DP methods share the identical per-round Gaussian mechanism (clip norm 1.0, δ = 10⁻⁵), so reported ε values are directly comparable.
+- All DP methods share the identical certified per-example DP-SGD mechanism (clip norm 1.0, δ = 10⁻⁵, Poisson subsampling, RDP accounting of the **total** training run), so reported ε values are certified end-to-end budgets at record (ICU-stay) adjacency, directly comparable across methods.
+- A uniform validation-selected decision threshold (max specificity s.t. validation sensitivity ≥ 0.70; Youden fallback) is applied to every method, private and non-private.
 
 ## License
 

@@ -1,18 +1,19 @@
 """
-Shared setup for the complementary evaluation harnesses (membership inference,
-bootstrap confidence intervals, participation-rate ablation).
+Shared setup for the post-review evaluation harnesses — v5 CERTIFIED-DP PROTOCOL.
 
-Rebuilds the exact experimental environment of moop_healthfl.py:
-same cached MIMIC-IV features, same StandardScaler fit, same care-unit client
-partition, same global test split (seed 42, stratified).
+Rebuilds the exact experimental environment of
+moop_healthfl.py (output_v5_real/):
 
-All scripts in this folder import from here so that every number they produce
-is computed on the identical federation used in the paper.
+  - patient-level 70/10/20 split, RandomState(42);
+  - each PATIENT assigned to exactly one client (modal care unit of their
+    training stays) -> no cross-client patient overlap;
+  - one-hot encoding (19 features); continuous features standardized with a
+    training-partition-only scaler;
+  - certified DP-SGD (per-example clipping + RDP accountant) via the v5
+    module; epsilon_k are TOTAL-training budgets in [1, 10].
 
-The cached feature file is produced automatically by the first run of
-    python moop_healthfl.py --mimic-path /path/to/mimic-iv
-and lands at output/mimic_iv_features.parquet. Point --cache-file at it if
-you used a non-default --output-dir.
+Also provides a PATIENT-CLUSTERED bootstrap (resample subject_id, keep all
+their stays) for honest CIs and paired method comparisons.
 """
 
 import os
@@ -21,82 +22,113 @@ import json
 import numpy as np
 import pandas as pd
 
-# --------------------------------------------------------------------------
-# Import the main experiment module (repository root, one directory up)
-# --------------------------------------------------------------------------
-REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, REPO_DIR)
+CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, CODE_DIR)
 
 import moop_healthfl as m  # noqa: E402
+import dp_core_v5 as dpc                    # noqa: E402
 
-# Cached parquet produced by the main experiment run
-DEFAULT_CACHE = os.path.join(REPO_DIR, "output", "mimic_iv_features.parquet")
+DEFAULT_CACHE = os.path.join(
+    CODE_DIR, "output", "mimic_iv_features_v2.parquet")
+# Fall back to the v4 cache (identical features + subject_id) if v5 not yet run.
+_V4_CACHE = os.path.join(CODE_DIR, "output_v4_real", "mimic_iv_features_v2.parquet")
 
-# Best-compromise per-client allocation, seed 42 (paper Table "Best Compromise
-# Per-Client Privacy Allocation"; avg eps = 0.887). The harnesses evaluate this
-# published operating point rather than re-running the NSGA-II search.
-MOOP_ALLOCATION_SEED42 = {0: 0.892, 1: 0.918, 2: 0.736, 3: 1.310, 4: 0.581}
+# v5 seed-42 best-compromise TOTAL-budget allocation.
+# Placeholder until the v5 run completes; update_from_v5() overwrites it.
+MOOP_ALLOCATION_SEED42 = None
 
 SEEDS = [42, 123, 456]
 
 
-def build_federation(cache_file: str = DEFAULT_CACHE, seed: int = 42):
-    """Recreate clients, trainer, test set and fairness evaluator.
+def _resolve_cache(cache_file):
+    if cache_file and os.path.exists(cache_file):
+        return cache_file
+    if os.path.exists(DEFAULT_CACHE):
+        return DEFAULT_CACHE
+    if os.path.exists(_V4_CACHE):
+        return _V4_CACHE
+    raise FileNotFoundError(
+        "No feature cache found. Run moop_healthfl.py once "
+        "with --mimic-path, or pass --cache-file.")
 
-    Mirrors run_experiments() in moop_healthfl.py exactly:
-    - median imputation over feature columns,
-    - StandardScaler fit on ALL rows,
-    - hospital_id partition into N_CLIENTS clients,
-    - global stratified 20% test split with random_state=42.
-    """
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.model_selection import train_test_split
 
-    if not os.path.exists(cache_file):
+def load_v5_allocation():
+    """Read the v5 seed-42 best-compromise allocation from the checkpoint."""
+    import pickle
+    ckpt = os.path.join(CODE_DIR, "output", "checkpoints",
+                        "experiment_results.pkl")
+    if not os.path.exists(ckpt):
         raise FileNotFoundError(
-            f"Cached features not found: {cache_file}\n"
-            "Run the main experiment once to build the cache:\n"
-            "    python moop_healthfl.py --mimic-path /path/to/mimic-iv\n"
-            "or pass --cache-file pointing at an existing "
-            "mimic_iv_features.parquet.")
+            f"v5 checkpoint not found ({ckpt}); run the main v5 experiment "
+            "before the harnesses so the published allocation exists.")
+    d = pickle.load(open(ckpt, "rb"))
+    alloc = d["42"]["moop_healthfl"]["best_allocation"]
+    return {int(k): float(v) for k, v in alloc.items()}
 
+
+def build_federation(cache_file: str = None, seed: int = 42):
+    """Recreate clients, trainer, test set and fairness evaluator, matching
+    moop_healthfl.run_experiments exactly. Returns
+    (clients, trainer, fairness_eval, test_demographics). trainer carries
+    X_val/y_val (used for the uniform threshold rule) and each client's
+    subject ids."""
+    from sklearn.preprocessing import StandardScaler
+
+    cache_file = _resolve_cache(cache_file)
     data = pd.read_parquet(cache_file)
+    if "subject_id" not in data.columns:
+        raise ValueError(f"{cache_file} has no subject_id column (v3 cache?).")
 
-    na_count = data[m.Config.FEATURE_COLS].isnull().sum().sum()
-    if na_count > 0:
-        for col in m.Config.FEATURE_COLS:
-            data[col] = data[col].fillna(data[col].median())
+    subjects = np.sort(data["subject_id"].unique())
+    rng_split = np.random.RandomState(42)
+    perm = rng_split.permutation(len(subjects))
+    n_test = int(round(m.Config.TEST_SIZE * len(subjects)))
+    n_val = int(round(m.Config.VAL_SIZE * len(subjects)))
+    test_subjects = set(subjects[perm[:n_test]])
+    val_subjects = set(subjects[perm[n_test:n_test + n_val]])
+    part = np.where(data["subject_id"].isin(test_subjects), "test",
+                    np.where(data["subject_id"].isin(val_subjects), "val", "train"))
+    data = data.assign(_partition=part)
+
+    train_rows = data[data["_partition"] == "train"].copy()
+    modal = (train_rows.groupby("subject_id")["hospital_id"]
+             .agg(lambda s: s.value_counts().index[0]))
+    train_rows["client_id"] = train_rows["subject_id"].map(modal).astype(int)
 
     scaler = StandardScaler()
-    scaler.fit(data[m.Config.FEATURE_COLS].values.astype(np.float32))
+    Xtr, _, _ = dpc.encode_features(train_rows)
+    scaler.fit(Xtr[:, :dpc.N_CONTINUOUS])
 
-    hospital_ids = sorted(data["hospital_id"].unique())[:m.Config.N_CLIENTS]
-    clients = [
-        m.FederatedClient(i, data[data["hospital_id"] == hid].reset_index(drop=True), scaler)
-        for i, hid in enumerate(hospital_ids)
-    ]
+    clients = []
+    for i in sorted(train_rows["client_id"].unique())[:m.Config.N_CLIENTS]:
+        cdf = train_rows[train_rows["client_id"] == i]
+        clients.append(m.FederatedClient(int(i), cdf.reset_index(drop=True), scaler))
 
-    all_X = np.vstack([c.X for c in clients])
-    all_y = np.concatenate([c.y for c in clients])
-    all_eth = np.concatenate([c.ethnicity for c in clients])
-    all_gen = np.concatenate([c.gender for c in clients])
+    def _extract(partition):
+        pdf = data[data["_partition"] == partition]
+        X, _, _ = dpc.encode_features(pdf)
+        nan = np.isnan(X)
+        if nan.any():
+            med = np.nanmedian(X, axis=0)
+            X[nan] = np.take(med, np.where(nan)[1])
+        X[:, :dpc.N_CONTINUOUS] = scaler.transform(X[:, :dpc.N_CONTINUOUS])
+        return (X.astype(np.float32), pdf["mortality"].values.astype(np.float32),
+                pdf["ethnicity"].values, pdf["gender"].values,
+                pdf["subject_id"].values)
 
-    _, X_test, _, y_test, _, eth_te, _, gen_te = train_test_split(
-        all_X, all_y, all_eth, all_gen,
-        test_size=m.Config.TEST_SIZE, random_state=42, stratify=all_y)
+    Xv, yv, ethv, genv, subv = _extract("val")
+    Xt, yt, etht, gent, subt = _extract("test")
 
-    test_demographics = pd.DataFrame({"ethnicity": eth_te, "gender": gen_te})
+    test_demographics = pd.DataFrame({"ethnicity": etht, "gender": gent,
+                                      "subject_id": subt})
     fairness_eval = m.FairnessEvaluator(test_demographics)
-    trainer = m.HealthcareFLTrainer(clients, X_test, y_test, seed=seed)
+    trainer = m.HealthcareFLTrainer(clients, Xt, yt, seed=seed, X_val=Xv, y_val=yv)
+    trainer._test_subjects = subt
     return clients, trainer, fairness_eval, test_demographics
 
 
-def method_registry():
-    """Headline methods evaluated by the extra harnesses.
-
-    Each entry: name -> callable(trainer, seed) -> (result_dict, eps_alloc)
-    eps_alloc is the per-client epsilon dict actually used (None for non-DP).
-    """
+def method_registry(alloc=None):
+    """Headline methods. alloc = v5 seed-42 MOOP allocation (dict)."""
     def fedavg(tr, s):
         return m.run_fedavg(tr, s), None
 
@@ -106,19 +138,34 @@ def method_registry():
         return _run
 
     def moop(tr, s):
-        # Full 50-round training with the paper's best-compromise allocation.
+        a = alloc if alloc is not None else load_v5_allocation()
         tr.reset(s)
         res = tr.train_federated(num_rounds=m.Config.GLOBAL_ROUNDS,
-                                 epsilon_allocations=MOOP_ALLOCATION_SEED42)
-        return res, dict(MOOP_ALLOCATION_SEED42)
+                                 epsilon_allocations=a)
+        return res, dict(a)
 
     return {
         "FedAvg": fedavg,
-        "Fixed-eps(0.5)": fixed(0.5),
         "Fixed-eps(1.0)": fixed(1.0),
+        "Fixed-eps(2.0)": fixed(2.0),
         "Fixed-eps(5.0)": fixed(5.0),
         "MOOP-HealthFL": moop,
     }
+
+
+# ---------------------------------------------------------------------------
+# Patient-clustered bootstrap (resample subjects, keep all their stays)
+# ---------------------------------------------------------------------------
+
+def clustered_bootstrap_indices(subject_ids: np.ndarray, rng):
+    """Return row indices for one clustered bootstrap resample: sample the
+    unique subjects with replacement, concatenate all rows of each drawn
+    subject (so the resample size varies slightly, as usual for cluster
+    bootstrap)."""
+    uniq = np.unique(subject_ids)
+    drawn = rng.choice(uniq, size=len(uniq), replace=True)
+    by_subj = {s: np.where(subject_ids == s)[0] for s in uniq}
+    return np.concatenate([by_subj[s] for s in drawn])
 
 
 def save_json(obj, path):

@@ -1,7 +1,7 @@
 """
 Client participation-rate ablation (efficiency objective strengthening).
 
-Addresses reviewer requirement: "Compare different client participation
+"Compare different client participation
 rates: 20%, 40%, 60%, 80%, 100%" so that the efficiency objective becomes a
 genuine trade-off rather than a constant.
 
@@ -17,6 +17,7 @@ Evaluated for the two headline configurations:
 Runtime: 2 methods x 5 rates x 3 seeds x (~3 min) ~= 90 min on 1 core.
 
 Usage:
+    cd moop-healthfl-release
     python3 experiments_extra/run_efficiency_ablation.py
 """
 
@@ -27,13 +28,19 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common_setup import (build_federation, save_json, SEEDS,  # noqa: E402
-                          MOOP_ALLOCATION_SEED42, m)
+                          load_v5_allocation, m)
+
+try:
+    MOOP_ALLOCATION_SEED42 = load_v5_allocation()
+except FileNotFoundError:
+    MOOP_ALLOCATION_SEED42 = {i: 1.0 for i in range(m.Config.N_CLIENTS)}
+    print("[warn] v5 allocation not found; MOOP participation uses uniform eps=1.0")
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                    "results", "efficiency_ablation_results.json")
 
 PARTICIPATION_RATES = [0.2, 0.4, 0.6, 0.8, 1.0]
-MODEL_MB = 3009 * 4 / 1e6  # float32 parameters, one direction
+MODEL_MB = 3393 * 4 / 1e6  # float32 parameters (19-64-32-1 MLP), one direction
 
 
 def train_with_participation(trainer, eps_alloc, rate, seed):

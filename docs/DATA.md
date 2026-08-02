@@ -2,7 +2,7 @@
 
 Everything the pipeline reads from MIMIC-IV, and every transformation applied,
 so that the cohort is fully reproducible from a credentialed copy of
-**MIMIC-IV v2.2** (https://physionet.org/content/mimiciv/2.2/).
+**MIMIC-IV v3.1** (https://physionet.org/content/mimiciv/3.1/).
 
 ## Required files
 
@@ -60,38 +60,58 @@ window, per-stay mean:
    (vitals + labs) are missing.
 3. Median-impute remaining missing clinical values; any residual NaN in the
    full feature set is median-imputed before scaling.
-4. Standardize all 13 features to zero mean / unit variance (scaler fit on the
-   full cohort).
+4. One-hot encode the categorical demographics (5 ethnicity + 3 insurance
+   indicators), giving a 19-dimensional input (10 continuous + gender +
+   8 indicators).
+5. Standardize the **continuous** features only, with the scaler fit
+   exclusively on the training partition and applied unchanged to the
+   validation and test partitions.
 
-Expected result with MIMIC-IV v2.2: **94,095 ICU stays, 11.8% mortality**.
+Expected result with MIMIC-IV v3.1: **94,095 ICU stays from 65,178 patients,
+11.8% mortality**.
 The natural class prevalence is deliberately preserved (no resampling); class
 imbalance is handled at the loss level during training.
 
+## Patient-level split
+
+All partitioning is at the **patient** level: the 65,178 unique `subject_id`s
+are split 70/10/20 into train/validation/test (`RandomState(42)`), so every
+stay of a patient falls into exactly one partition — 65,613 / 9,524 / 18,958
+stays respectively, fixed across all methods and seeds. The validation split
+is used only for threshold selection and NSGA-II fitness; all reported
+results come from the held-out test split.
+
 ## Federated client partition (`hospital_id`)
 
-Clients are defined by `first_careunit`:
+Clients are defined by `first_careunit`, and each **training patient is
+assigned to exactly one client** (the modal care unit of their stays; 6,800
+multi-unit patients, 9,426 stays = 14.4% of the training partition
+reassigned; zero cross-client patient overlap). Expected training partition:
 
-| Client | Care units | Expected n | Mortality |
-|---|---|---|---|
-| Hospital 0 | MICU | 20,616 | 16.4% |
-| Hospital 1 | MICU/SICU | 15,393 | 15.4% |
-| Hospital 2 | CVICU | 14,745 | 4.3% |
-| Hospital 3 | SICU + CCU | 23,676 | 12.5% |
-| Hospital 4 | TSICU + Neuro SICU + other/unmapped | 19,665 | 9.2% |
+| Client | Care units | Training stays | Patients | Mortality |
+|---|---|---|---|---|
+| Hospital 0 | MICU | 15,023 | 8,952 | 15.6% |
+| Hospital 1 | MICU/SICU | 10,542 | 7,084 | 15.5% |
+| Hospital 2 | CVICU | 9,998 | 7,966 | 4.8% |
+| Hospital 3 | SICU + CCU | 16,461 | 11,291 | 12.8% |
+| Hospital 4 | TSICU + Neuro SICU + other/unmapped | 13,589 | 10,331 | 8.9% |
 
 This is a **simulated** federation (single-source, care-unit-partitioned) —
 a controlled proxy for institutional heterogeneity, not a multi-hospital
 deployment.
 
-## Test split
+## Privacy unit
 
-Global test set: 20% stratified split of the pooled cohort,
-`random_state=42`, fixed across all methods and seeds (18,819 samples).
+The certified (ε, δ) guarantees are at **record (ICU-stay) adjacency** within
+a client's training set. One patient can contribute multiple stays to a
+client (median 1; 75% single-stay; maximum 41), so a patient-level guarantee
+follows only via group privacy — see the paper's privacy-accounting section.
 
 ## Caching
 
 The first run writes the final feature table to
-`<output-dir>/mimic_iv_features.parquet` (columns: `stay_id, hospital_id,
-mortality, age, gender, ethnicity, insurance` + the nine clinical features).
+`<output-dir>/mimic_iv_features_v2.parquet` (columns: `stay_id, subject_id,
+hospital_id, mortality, age, gender, ethnicity, insurance` + the nine
+clinical features; `subject_id` is retained for the patient-level split).
 Subsequent runs and all `experiments_extra/` harnesses start from this cache.
 **The cache is derived from MIMIC-IV and must not be shared or committed.**

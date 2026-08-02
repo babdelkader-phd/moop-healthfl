@@ -7,8 +7,6 @@ pymoo==0.6.1.3
 pyarrow>=12.0          # parquet feature cache
 matplotlib>=3.7        # result figures
 
-# Optional: TensorFlow backend for the MLP. If absent, the pipeline
-# automatically falls back to the built-in pure-NumPy MLP (same architecture,
-# same results within stochastic variation; used for the paper's runs on
-# Apple Silicon).
-# tensorflow>=2.10
+# TensorFlow is intentionally NOT used: certified per-example DP-SGD is
+# implemented in the built-in pure-NumPy backend for exact control of
+# clipping, Poisson sampling, and noise. No GPU is required.

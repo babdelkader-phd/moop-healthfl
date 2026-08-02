@@ -1,0 +1,18 @@
+# Experiment outputs (contain MIMIC-IV-derived data — never commit)
+output/
+*output*/
+*.parquet
+checkpoints/
+logs/
+results/
+*.pkl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

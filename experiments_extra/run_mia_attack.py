@@ -1,8 +1,6 @@
 """
 Empirical membership inference attack (MIA) evaluation.
 
-Addresses reviewer requirement: "add at least one empirical privacy attack".
-
 Attack: Yeom et al. (CSF 2018) loss-threshold membership inference, plus a
 prediction-confidence variant. For each trained global model we score every
 sample by its per-sample binary cross-entropy loss (and max-confidence); an
@@ -15,15 +13,12 @@ attacker predicts "member" for low-loss samples. We report:
 Membership ground truth uses the per-client train/validation splits that the
 federated pipeline itself uses (client.get_train_test_split(seed)): the local
 80% partitions are the true training members; the local 20% partitions are
-same-distribution non-members. These sets are disjoint by construction.
-
-Expected outcome: FedAvg (no DP) leaks most; attack AUC should decrease toward
-0.5 as allocated epsilon decreases; MOOP-HealthFL (avg eps=0.887) should sit
-near Fixed-eps(1.0). Balanced member/non-member sampling keeps base rate 50%.
-
-Runtime: ~5 methods x 3 seeds x (~3 min full training) ~= 45-60 min on 1 core.
+same-distribution non-members. These sets are disjoint by construction. Under
+the v4 corrected protocol both are drawn from the patient-level TRAIN
+partition only (test/val patients are never trained on).
 
 Usage:
+    cd moop-healthfl-release
     python3 experiments_extra/run_mia_attack.py [--seeds 42 123 456]
 """
 
