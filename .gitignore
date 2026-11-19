@@ -10,7 +10,8 @@ results/
 # Python
 __pycache__/
 *.pyc
-.venv/
+.venv*/
+.pytest_cache/
 
 # OS / editors
 .DS_Store

@@ -21,8 +21,11 @@ This repository contains the full implementation and evaluation harnesses for th
 | `moop_healthfl.py` | The complete pipeline: MIMIC-IV feature extraction, patient-level split and patient→client assignment, certified DP-FL training (pure-NumPy MLP with per-example gradients), all ten methods, NSGA-II + LHS searches, five-level fairness evaluation, figures |
 | `dp_core_v5.py` | Certified-DP core: RDP accountant for the Poisson-subsampled Gaussian mechanism, noise calibration by binary search, per-example gradients, clipping/noising, one-hot encoding, uniform validation threshold rule, operating-point metrics |
 | `experiments_extra/` | Complementary harnesses: patient-clustered bootstrap CIs + paired test, membership inference attack, stay-vs-patient split ablation, reduced-round search fidelity, participation-rate ablation |
+| `analysis/` | Post-hoc analyses from saved predictions (no training): main table over splits × seeds, calibration and recalibration, alert burden with patient-clustered bootstrap, global vs per-unit thresholds. `python analysis/run_posthoc.py --root <dir holding split*/> --out results_revision` |
+| `tests/` | Test suite: accountant vs. Google `dp-accounting` (RDP match, PLD upper-bound check), finite-difference check of per-example gradients, clipping sensitivity, patient-disjointness, seed determinism |
+| `docs/PRIVACY_LEDGER.md` | Every use of patient data and how it is covered: mechanism, design/deployment cohorts, composed cost of a search, ablation switches |
 | `docs/DATA.md` | Exact data requirements: MIMIC-IV files, item IDs, cohort definition, client partition |
-| `requirements.txt` | Tested dependency set (Python ≥ 3.9) |
+| `requirements.txt` | Runtime dependencies (`requirements-dev.txt` adds the test dependencies) |
 
 No patient data is included or ever committed (see `.gitignore`); the pipeline builds its feature cache locally from your own credentialed MIMIC-IV copy.
 
@@ -33,7 +36,14 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-TensorFlow is **not** required: certified per-example DP-SGD is implemented in the built-in pure-NumPy backend (19–64–32–1 MLP, 3,393 parameters), which is what produced the paper's results.
+No deep-learning framework is required: certified per-example DP-SGD is implemented in a pure-NumPy backend (19–64–32–1 MLP, 3,393 parameters), which is what produced the paper's results.
+
+To run the tests (no MIMIC-IV needed):
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
 
 ## Getting the data
 
@@ -60,9 +70,13 @@ python moop_healthfl.py --mimic-path /path/to/mimic-iv-3.1 --output-dir output
 ```
 
 - **First run** extracts features from the raw CSVs (~15–30 min) and caches them to `output/mimic_iv_features_v2.parquet` (the cache retains `subject_id` for the patient-level split); later runs start from the cache in seconds.
+- **Later runs** need no `--mimic-path`: the cache in `--output-dir` (or `--cache-file`) is used directly.
 - **Checkpointing**: per-seed, per-method results are checkpointed; interrupted runs resume where they stopped.
+- **Saved predictions**: every trained model's validation and test probabilities, its threshold, and each client's ε, σ, sampling rate and step count are written to `output/predictions/seed<seed>_<method>.npz`; `output/predictions/eval_split.npz` holds the aligned labels, patient/stay identifiers, care unit, ethnicity, gender and insurance. Calibration, threshold, subgroup and bootstrap analyses can be run from these files without retraining. They are MIMIC-derived and must not be redistributed.
+- **Parallelism**: baselines run one process per (method, seed); searches evaluate candidates across the pool. Each process uses a single BLAS thread. `--n-jobs` sets the pool size.
+- **Options**: `--methods fedavg fixed_eps_1.0 …` runs a subset; `--seed` a single training seed; `--split-seed` changes the patient-level split (default 42).
 - **Runtime**: the NSGA-II search is the dominant cost — approximately **9.5–10 hours per seed** with 15 parallel workers (use `--n-jobs` to control); the complete experiment (10 methods × 3 seeds, including the LHS control) took ≈ 90 hours on a 16-core CPU machine. Individual baselines take minutes.
-- **Noise calibration**: the RDP accountant calibrates each client's noise multiplier once per (ε, sampling rate, step count) so that the *full 50-round protocol* satisfies the client's total (ε, δ = 10⁻⁵) budget at record (ICU-stay) adjacency; calibrations are cached.
+- **Noise calibration**: the RDP accountant calibrates each client's noise multiplier once per (ε, sampling rate, step count) so that the *full 50-round protocol* satisfies the client's total (ε, δ = 10⁻⁵) budget at patient-level adjacency; calibrations are cached.
 - **Smoke test** (no MIMIC-IV needed — synthetic data fallback, reduced NSGA-II):
 
 ```bash
@@ -104,10 +118,12 @@ Exact values vary slightly with hardware/BLAS; the qualitative ordering and all 
 
 ## Reproducibility notes
 
-- Seeds 42, 123, 456 control data splits, model init, DP noise, and NSGA-II.
+- Seeds 42, 123, 456 control model initialisation, dropout, Poisson sampling, DP noise, and NSGA-II; a run is fully determined by its seed, and parallel and sequential execution give identical results. The patient-level data split is controlled separately by `--split-seed` (default 42) and is the same for all three seeds.
 - All partitioning is at the **patient** level (70/10/20 by `subject_id`, `RandomState(42)`), and each training patient is assigned to exactly one client (modal care unit) — zero cross-client patient overlap.
 - The federation is **simulated**: MIMIC-IV is partitioned by ICU care unit into five clients (single-source proxy for institutional heterogeneity) — see the paper's threat-to-validity discussion.
-- All DP methods share the identical certified per-example DP-SGD mechanism (clip norm 1.0, δ = 10⁻⁵, Poisson subsampling, RDP accounting of the **total** training run), so reported ε values are certified end-to-end budgets at record (ICU-stay) adjacency, directly comparable across methods.
+- All DP methods share the identical certified DP-SGD mechanism at **patient-level** adjacency: patients are Poisson-sampled, each sampled patient's summed gradient is clipped (norm 1.0), δ = 10⁻⁵, and the RDP accountant covers the **total** training run. `--privacy-unit record` gives the stay-level variant for comparison.
+- Preprocessing uses fixed public clinical reference values only; no statistic is fitted to patient data. The class weight comes from a public 10% mortality prior.
+- Budget searches train on a disjoint **design cohort** (50% of training patients); every reported model trains once on the **deployment cohort**, so its ε is a guarantee for the whole workflow. See [docs/PRIVACY_LEDGER.md](docs/PRIVACY_LEDGER.md).
 - A uniform validation-selected decision threshold (max specificity s.t. validation sensitivity ≥ 0.70; Youden fallback) is applied to every method, private and non-private.
 
 ## License

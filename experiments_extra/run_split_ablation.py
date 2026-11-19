@@ -18,7 +18,6 @@ certified DP], and MOOP-HealthFL, isolating how much apparent performance
 (especially sensitivity) is manufactured by stay-level leakage.
 
 Usage:
-    cd moop-healthfl-release
     python3 experiments_extra/run_split_ablation.py
 """
 
@@ -29,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common_setup import (m, dpc, _resolve_cache, load_v5_allocation,  # noqa: E402
+from common_setup import (m, _resolve_cache, load_v5_allocation,  # noqa: E402
                           save_json, SEEDS)
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -40,53 +39,10 @@ def build_split(data, split_unit, seed_split=42):
     """Return (clients, X_val, y_val, X_test, y_test) for the given split
     unit ('patient' or 'stay'). Patient-level assigns each patient to one
     client (modal care unit); stay-level keeps the raw care-unit client."""
-    from sklearn.preprocessing import StandardScaler
-    rng = np.random.RandomState(seed_split)
-
-    if split_unit == "patient":
-        units = np.sort(data["subject_id"].unique())
-    else:
-        units = np.sort(data.index.values)
-    perm = rng.permutation(len(units))
-    n_test = int(round(m.Config.TEST_SIZE * len(units)))
-    n_val = int(round(m.Config.VAL_SIZE * len(units)))
-    test_u = set(units[perm[:n_test]]); val_u = set(units[perm[n_test:n_test + n_val]])
-
-    if split_unit == "patient":
-        part = np.where(data["subject_id"].isin(test_u), "test",
-                        np.where(data["subject_id"].isin(val_u), "val", "train"))
-    else:
-        idx = data.index.values
-        part = np.where(np.isin(idx, list(test_u)), "test",
-                        np.where(np.isin(idx, list(val_u)), "val", "train"))
-    data = data.assign(_partition=part)
-    train_rows = data[data["_partition"] == "train"].copy()
-
-    if split_unit == "patient":
-        modal = (train_rows.groupby("subject_id")["hospital_id"]
-                 .agg(lambda s: s.value_counts().index[0]))
-        train_rows["client_id"] = train_rows["subject_id"].map(modal).astype(int)
-    else:
-        train_rows["client_id"] = train_rows["hospital_id"]
-
-    scaler = StandardScaler()
-    Xtr, _, _ = dpc.encode_features(train_rows)
-    scaler.fit(Xtr[:, :dpc.N_CONTINUOUS])
-    clients = [m.FederatedClient(int(i),
-               train_rows[train_rows["client_id"] == i].reset_index(drop=True), scaler)
-               for i in sorted(train_rows["client_id"].unique())[:m.Config.N_CLIENTS]]
-
-    def _extract(p):
-        pdf = data[data["_partition"] == p]
-        X, _, _ = dpc.encode_features(pdf)
-        nan = np.isnan(X)
-        if nan.any():
-            med = np.nanmedian(X, axis=0); X[nan] = np.take(med, np.where(nan)[1])
-        X[:, :dpc.N_CONTINUOUS] = scaler.transform(X[:, :dpc.N_CONTINUOUS])
-        return X.astype(np.float32), pdf["mortality"].values.astype(np.float32)
-
-    Xv, yv = _extract("val"); Xt, yt = _extract("test")
-    return clients, Xv, yv, Xt, yt
+    fed = m.prepare_federation(data, split_seed=seed_split,
+                               split_unit=split_unit)
+    return (fed["clients"], fed["X_val"], fed["y_val"],
+            fed["X_test"], fed["y_test"])
 
 
 def main():

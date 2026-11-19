@@ -58,14 +58,18 @@ window, per-stay mean:
 1. Keep all adult ICU stays (age clipped to 18–91).
 2. Drop stays where more than 50% of the nine clinical features
    (vitals + labs) are missing.
-3. Median-impute remaining missing clinical values; any residual NaN in the
-   full feature set is median-imputed before scaling.
+3. Missing clinical values stay missing in the cached feature table and are
+   set at load time to a fixed public reference value per feature
+   (`dp_core_v5.CLINICAL_REFERENCE`). Hemoglobin (item 50811) is missing in
+   81% of stays and lactate in 46%.
 4. One-hot encode the categorical demographics (5 ethnicity + 3 insurance
    indicators), giving a 19-dimensional input (10 continuous + gender +
    8 indicators).
-5. Standardize the **continuous** features only, with the scaler fit
-   exclusively on the training partition and applied unchanged to the
-   validation and test partitions.
+5. Transform the **continuous** features only: (x − reference) / scale with
+   the same public constants, clipped to [−5, 5]. Nothing is fitted to the
+   data, so no statistic crosses the train/validation/test boundary and
+   preprocessing has no privacy cost. Clipping also neutralises gross
+   charting errors in the raw data.
 
 Expected result with MIMIC-IV v3.1: **94,095 ICU stays from 65,178 patients,
 11.8% mortality**.
@@ -102,10 +106,14 @@ deployment.
 
 ## Privacy unit
 
-The certified (ε, δ) guarantees are at **record (ICU-stay) adjacency** within
-a client's training set. One patient can contribute multiple stays to a
-client (median 1; 75% single-stay; maximum 41), so a patient-level guarantee
-follows only via group privacy — see the paper's privacy-accounting section.
+The certified (ε, δ) guarantees are at **patient-level adjacency**: adding or
+removing one patient, with all of their ICU stays, from a client's training
+set. One patient can contribute multiple stays (median 1; 75% single-stay;
+maximum 41); the mechanism clips each patient's summed contribution, so the
+guarantee does not depend on the number of stays. The table above lists the
+full training partition; within each client 50% of patients form the design
+cohort (budget search only) and 50% the deployment cohort (reported models).
+See [PRIVACY_LEDGER.md](PRIVACY_LEDGER.md).
 
 ## Caching
 

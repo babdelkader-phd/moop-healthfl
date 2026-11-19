@@ -18,7 +18,6 @@ the v4 corrected protocol both are drawn from the patient-level TRAIN
 partition only (test/val patients are never trained on).
 
 Usage:
-    cd moop-healthfl-release
     python3 experiments_extra/run_mia_attack.py [--seeds 42 123 456]
 """
 

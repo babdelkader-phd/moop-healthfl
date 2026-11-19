@@ -7,7 +7,6 @@ Bootstrap confidence intervals + per-group fairness breakdown.
   - "worst-group sensitivity and worst-group AUROC"
 
 Usage:
-    cd moop-healthfl-release
     python3 experiments_extra/run_bootstrap_ci.py [--n-boot 1000]
 """
 
@@ -118,7 +117,6 @@ def main():
     ap.add_argument("--cache-file", default=None)
     args = ap.parse_args()
 
-    import dp_core_v5 as dpc
     results = {}
     paired = {}
     for seed in args.seeds:
