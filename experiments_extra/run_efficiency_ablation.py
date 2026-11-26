@@ -17,7 +17,6 @@ Evaluated for the two headline configurations:
 Runtime: 2 methods x 5 rates x 3 seeds x (~3 min) ~= 90 min on 1 core.
 
 Usage:
-    cd moop-healthfl-release
     python3 experiments_extra/run_efficiency_ablation.py
 """
 

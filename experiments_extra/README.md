@@ -1,15 +1,18 @@
 # Post-Review Evaluation Harnesses (v5 certified-DP protocol)
 
 Scripts for the complementary analyses. All rebuild the **exact** federation
-of the v5 certified-DP run (`output/`) by importing
-`moop_healthfl.py` and `dp_core_v5.py`:
+of the main run through `moop_healthfl.prepare_federation` (the single
+implementation of imputation, split, client assignment and scaling):
 
 - patient-level 70/10/20 split, RandomState(42);
 - each patient assigned to exactly one client (modal care unit) — no
   cross-client patient overlap;
-- one-hot encoding (19 features), train-only scaler;
-- certified DP-SGD (per-example clipping + RDP accountant), ε = **total**
-  training budget in [1, 10];
+- one-hot encoding (19 features), preprocessing from public reference
+  values (nothing fitted to the data);
+- 50% of each client's training patients held out as the design cohort;
+  harnesses train on the deployment cohort;
+- certified DP-SGD at patient level (per-patient clipping + RDP accountant),
+  ε = **total** training budget in [1, 10];
 - uniform validation-selected decision threshold for every method.
 
 | Script | Item addressed | Approx. runtime |
@@ -29,7 +32,7 @@ absent, `common_setup.load_v5_allocation()` raises (split ablation falls back
 to uniform ε=1 with a warning).
 
 ```bash
-cd moop-healthfl-release
+
 python3 moop_healthfl.py --mimic-path "/path/to/mimic-iv-3.1" --output-dir output
 # then:
 python3 experiments_extra/run_bootstrap_ci.py --n-boot 1000
@@ -43,10 +46,20 @@ Outputs land in `experiments_extra/results/*.json`.
 
 ## Privacy unit (important)
 
-The certified guarantee is at **record (ICU-stay) adjacency**: adding or
-removing one stay. Because a patient can contribute up to 41 stays to one
-client (median 1; 75% of patients have a single stay), a *patient-level*
-guarantee follows only via group privacy with a factor equal to that count.
-State the stay-level unit explicitly in the manuscript; a per-patient
-guarantee would require grouping each patient's stays into one clipped
-contribution (a possible refinement, not implemented here).
+The certified guarantee is at **patient-level adjacency**: adding or removing
+one patient with all of their ICU stays. Each sampled patient's summed
+gradient is clipped, so no group-privacy factor is needed. The harnesses
+train on the deployment cohort, like the main run. See
+[../docs/PRIVACY_LEDGER.md](../docs/PRIVACY_LEDGER.md).
+
+## run_dp_mechanism.py (added in the revision)
+
+`mechanism`: clipping-versus-noise ablation on the deployment cohort (non-private,
+sampling only, clipping only, clipping + certified noise, with and without class
+weighting, several clipping norms). Arms with the noise switched off carry no privacy
+guarantee. `tuning`: sensitivity of certified training to clipping norm, lot size and
+learning rate, trained on the design cohort and scored on validation, followed by one
+confirmation of the best configuration on the deployment cohort. Runs in parallel
+(`--n-jobs`); results go to `results_revision/dp_*.csv`.
+`design-fraction`: compares design cohorts of 25% and 50% of training patients by the
+cost to the deployment model and by how well the search proxy separates budgets.

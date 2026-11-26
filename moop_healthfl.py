@@ -1,70 +1,47 @@
 #!/usr/bin/env python3
 """
-MOOP-HealthFL — Certified Differential Privacy + Protocol Upgrades
-Multi-Objective Optimization for Privacy-Aware Healthcare Federated Learning
+MOOP-HealthFL -- certified differential privacy in clinical federated learning
+with multi-objective per-client privacy-budget selection.
 
-the evaluation protocol, corrected in
-response to pre-submission review:
-  (1) PATIENT-LEVEL SPLIT: train/val/test partitions are drawn over
-      subject_id, so all ICU stays of one patient fall in exactly one
-      partition (v3 split at stay level).
-  (2) NO TRAIN/TEST OVERLAP: clients train only on the train partition;
-      test and validation rows are excluded from all local training data
-      (in v3 the global test rows overlapped client training rows).
-  (3) TRAIN-ONLY NORMALIZATION: the StandardScaler is fit on training
-      rows only (v3 fit it on all rows).
-  (4) VALIDATION-BASED SEARCH: NSGA-II fitness (MOOP-HealthFL,
-      MO-Privacy, MO-Efficiency) is evaluated on the validation split;
-      the test split is used exclusively for final reporting.
-Residual caveat: clinical-feature median imputation at cache-build time
-still uses cohort medians (pre-split); this affects imputed entries only.
-Requires the v2 feature cache (mimic_iv_features_v2.parquet, retains
-subject_id); an existing copy in output_v4_real/ is reused automatically.
+Protocol
+  * Patient-level 70/10/20 split over subject_id; each training patient is
+    assigned to exactly one client (modal care unit).
+  * 19 one-hot features; continuous features preprocessed with public
+    clinical reference values only (no statistic fitted on patient data).
+  * Certified DP-SGD (dp_core_v5) at PATIENT-level adjacency: Poisson
+    sampling of patients at q = B / n_patients, all stays of a sampled
+    patient form one contribution whose summed gradient is l2-clipped,
+    Gaussian noise on the per-step sum, noise multiplier calibrated by an
+    RDP accountant so that the full GLOBAL_ROUNDS protocol meets each
+    client's total (epsilon, delta) budget. Decision variables are total
+    budgets eps_k in [1, 10].
+  * Design/deployment separation: budget searches train only on a disjoint
+    design cohort of patients; every reported model is trained once on the
+    deployment cohort, whose guarantee is therefore the single-run
+    certificate. The composed cost of the searches is reported separately.
+  * One prespecified decision-threshold rule for every method: maximum
+    specificity subject to validation sensitivity >= 0.70 (Youden fallback).
 
-Changes (pre-submission review, 2026-07):
-  (A) CERTIFIED DP-SGD: per-example l2 clipping (C=1.0), Poisson
-      sampling at rate q=B/n_local, Gaussian noise on the per-step sum,
-      noise multiplier calibrated by an RDP accountant (dp_core_v5) so
-      the FULL 50-round protocol meets the client's TOTAL-training
-      (epsilon, delta=1e-5) budget at record (ICU-stay) adjacency.
-      Decision variables are now total budgets eps_k in [1, 10].
-  (B) One-hot encoding of ethnicity/insurance (19 features); continuous
-      features standardized with a train-only scaler; dummies untouched.
-  (C) Each PATIENT assigned to exactly one client (modal care unit).
-  (D) Uniform prespecified decision-threshold rule for EVERY method:
-      max specificity s.t. validation sensitivity >= 0.70 (Youden
-      fallback), selected on the validation split, applied to test.
-  (E) 3 objectives (privacy, utility, fairness); efficiency removed
-      from the search (it was saturated in v4); constraint g3 is now
-      the MAX per-attribute FNR gap <= 0.20.
-  (F) LHS random-search control with identical budget; per-generation
-      hypervolume for NSGA-II.
-  (G) Patient-disjoint local 80/20 splits; per-round trajectories
-      logged on validation only; AUPRC/PPV/NPV reported.
-  (H) Old DP-SGD and MO-Efficiency baselines removed (the mechanism
-      now IS DP-SGD; efficiency left the objective vector).
+Search
+  Objectives (3): privacy loss = mean(eps_k) / eps_max; utility loss =
+  1 - AUROC; fairness loss = unified five-level fairness deficit.
+  Constraints (3): sensitivity >= 0.70; AUROC >= 0.60; max per-attribute
+  FNR gap <= 0.20. Fitness is evaluated on the validation split.
 
-NSGA-II population evaluations run in parallel across all machine cores.
+Methods (10)
+  FedAvg, FairFed, FCFL, Fixed-eps(1/2/5/10), MO-Privacy (2-objective
+  NSGA-II), LHS-Search (random-search control), MOOP-HealthFL (3-objective
+  NSGA-II).
 
-Objectives (4):
-  1. Privacy Loss    = mean(eps_k) / eps_max
-  2. Utility Loss    = 1 - AUC
-  3. Fairness Loss   = unified 5-level fairness metric
-  4. Efficiency Loss = communication + compute cost
+Reproducibility
+  A run is fully determined by its seed: weight initialisation, dropout,
+  Poisson sampling and Gaussian noise all derive from the NumPy state set
+  by HealthcareFLTrainer.reset(seed). Every trained model's validation and
+  test probabilities are written to <output-dir>/predictions/.
 
-Constraints (3):
-  g1: sensitivity >= SENSITIVITY_MIN (0.70)
-  g2: AUC >= AUC_MIN (0.60)
-  g3: fairness_gap <= FAIRNESS_GAP_MAX (0.20)
-
-Methods (11):
-  FedAvg, Fixed-eps(0.5/1.0/2.0/5.0), DP-SGD, FairFed, FCFL,
-  MO-Privacy, MO-Efficiency, MOOP-HealthFL
-
-Usage:
-  python moop_healthfl_v5_certified_dp.py [--fast] [--n-jobs N]
-                                      [--mimic-path PATH] [--output-dir DIR]
-                                      [--seed SEED]
+Usage
+  python moop_healthfl.py --mimic-path PATH [--output-dir DIR] [--n-jobs N]
+                          [--seed SEED] [--fast]
 """
 
 import argparse
@@ -79,11 +56,20 @@ from multiprocessing import Pool
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# One BLAS thread per process: the model is tiny (3,393 parameters), so
+# intra-op threading only adds overhead and oversubscribes the worker pool.
+# Must be set before NumPy is imported; respects values already exported.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# Also cap BLAS at runtime, for callers that imported NumPy before this module.
+from threadpoolctl import threadpool_limits
+threadpool_limits(limits=1)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -122,13 +108,33 @@ class Config:
     GLOBAL_ROUNDS = 50
     LOCAL_EPOCHS = 5
     BATCH_SIZE = 64
-    LEARNING_RATE = 0.001
+    LEARNING_RATE = 0.001         # non-private training
+    # Hidden-layer widths. (64, 32) is the model of the paper (3,393
+    # parameters); wider settings are used only by the capacity experiment
+    # (experiments_extra/run_capacity.py).
+    HIDDEN = (64, 32)
+    DP_LEARNING_RATE = 0.003      # certified (clipped, noised) training
 
-    # Privacy (v5: TOTAL-training budgets, certified via RDP accountant)
+    # Privacy boundary (see docs/PRIVACY_LEDGER.md). The second value of each
+    # switch reproduces the original submission and exists only for ablation.
+    PRIVACY_UNIT = "patient"      # "patient": clip per patient | "record": per ICU stay
+    PREPROCESSING = "reference"   # "reference": public constants | "cohort": fitted statistics
+    CLASS_WEIGHT = "prior"        # "prior": from MORTALITY_PRIOR | "pooled": from training labels
+    MORTALITY_PRIOR = 0.10        # public prior for ICU in-hospital mortality
+    DESIGN_FRACTION = 0.50        # share of training patients reserved for budget search (0 = none)
+
+    # Privacy (TOTAL-training budgets, certified via RDP accountant)
     EPSILON_MIN = 1.0
     EPSILON_MAX = 10.0
     DELTA = 1e-5
-    CLIPPING_NORM = 1.0
+    # Clipping norm and DP learning rate were selected on the DESIGN cohort
+    # (experiments_extra/run_dp_mechanism.py tuning; best of 45 configurations
+    # on two patient splits). The submission used C = 1.0 and lr = 0.001.
+    CLIPPING_NORM = 30.0
+    # Ablation only (experiments_extra/run_dp_mechanism.py): multiplies the
+    # calibrated noise multiplier. Any value other than 1.0 VOIDS the
+    # certificate (0.0 = clipping without noise).
+    NOISE_SCALE = 1.0
     SENS_TARGET = 0.70   # validation threshold-rule target sensitivity
 
     # NSGA-II (full mode)
@@ -137,10 +143,19 @@ class Config:
     N_OFFSPRINGS = 25
     EVAL_ROUNDS = 15
 
-    # Constraints
-    SENSITIVITY_MIN = 0.70
+    # Constraints (evaluated on cross-fitted validation decisions, i.e. with a
+    # threshold chosen on other validation patients). The threshold rule
+    # targets sensitivity 0.70; out of sample that is met only on average, so
+    # the constraint allows a 5-point shortfall instead of rejecting about
+    # half of all candidates by chance.
+    SENSITIVITY_MIN = 0.65
     AUC_MIN = 0.60
     FAIRNESS_GAP_MAX = 0.20
+
+    # Fairness objective of the search: "five_level" (composite score) or
+    # "fnr_gap" (largest subgroup false-negative-rate gap, a direct clinical
+    # quantity; used for the objective sensitivity analysis).
+    FAIRNESS_OBJECTIVE = "five_level"
 
     # Fairness weights
     W_OUTCOME = 0.30
@@ -163,28 +178,39 @@ class Config:
 
 
 # ---------------------------------------------------------------------------
-# TensorFlow / sklearn setup
+# Model (NumPy backend: exact control of clipping, sampling, and noise)
 # ---------------------------------------------------------------------------
 
-# v5: TensorFlow backend disabled — per-example DP-SGD is implemented in
-# the NumPy backend for exact control of clipping, sampling, and noise.
-TF_AVAILABLE = False
 import dp_core_v5 as dpc
 
 NONPRIVATE_EPS = 1e5   # allocations >= this run the non-private path
 
 
-class NumpyMLPWrapper:
-    """Pure-numpy MLP (13→64→32→1) with full DP-SGD support.
+def _apply_env_overrides():
+    """MOOP_CONFIG='{"HIDDEN": [256, 128], "CLIPPING_NORM": 10}' overrides
+    Config attributes in every script and harness that imports this module
+    (used by the capacity experiment). Overridden values are part of the
+    saved run configuration."""
+    raw = os.environ.get("MOOP_CONFIG")
+    if not raw:
+        return
+    for k, v in json.loads(raw).items():
+        if not hasattr(Config, k):
+            raise KeyError(f"MOOP_CONFIG: unknown Config attribute {k!r}")
+        setattr(Config, k, tuple(v) if isinstance(v, list) else v)
 
-    Replaces TensorFlow as the fallback model — no extra dependencies,
-    works on Python 3.13 / Apple Silicon.  Implements:
-      - He-initialised weights
-      - ReLU activations + Dropout (training mode only)
-      - Class-balanced BCE loss (handles ~12% mortality imbalance)
-      - Adam optimiser
-      - get_weights / set_weights compatible with FedAvg
-      - Exposed gradients for DP-SGD noise injection
+
+_apply_env_overrides()
+
+
+class NumpyMLPWrapper:
+    """Pure-NumPy MLP (19-h1-h2-1; Config.HIDDEN = (64, 32) gives the 3,393
+    parameters of the paper).
+
+    He-initialised weights, ReLU activations, dropout 0.3/0.2 in training
+    mode, Adam optimiser. Gradients of the class-weighted BCE loss come from
+    dp_core_v5 (clipped_noisy_grads on the private path, batch_grads
+    otherwise); there is no weight decay. get_weights / set_weights are used by federated averaging.
     """
 
     def __init__(self, input_dim: int = dpc.N_FEATURES, lr: float = 0.001):
@@ -192,12 +218,15 @@ class NumpyMLPWrapper:
         self._init_weights(input_dim)
 
     def _init_weights(self, input_dim: int):
-        rng = np.random.default_rng()
-        self.W1 = (rng.standard_normal((input_dim, 64)) * np.sqrt(2 / input_dim)).astype(np.float32)
-        self.b1 = np.zeros(64, dtype=np.float32)
-        self.W2 = (rng.standard_normal((64, 32)) * np.sqrt(2 / 64)).astype(np.float32)
-        self.b2 = np.zeros(32, dtype=np.float32)
-        self.W3 = (rng.standard_normal((32, 1)) * np.sqrt(2 / 32)).astype(np.float32)
+        # Seeded from the global NumPy state (set by trainer.reset(seed)) so
+        # that a run is fully determined by its seed.
+        rng = np.random.default_rng(np.random.randint(0, 2**31 - 1))
+        h1, h2 = Config.HIDDEN
+        self.W1 = (rng.standard_normal((input_dim, h1)) * np.sqrt(2 / input_dim)).astype(np.float32)
+        self.b1 = np.zeros(h1, dtype=np.float32)
+        self.W2 = (rng.standard_normal((h1, h2)) * np.sqrt(2 / h1)).astype(np.float32)
+        self.b2 = np.zeros(h2, dtype=np.float32)
+        self.W3 = (rng.standard_normal((h2, 1)) * np.sqrt(2 / h2)).astype(np.float32)
         self.b3 = np.zeros(1, dtype=np.float32)
         self._reset_adam()
 
@@ -214,45 +243,23 @@ class NumpyMLPWrapper:
     # ------------------------------------------------------------------
 
     def _forward(self, X: np.ndarray, training: bool = False):
+        """Returns (probabilities, cache). cache = (X, a1, a2, z3, g1, g2):
+        hidden activations as fed forward (after dropout) and their
+        derivatives w.r.t. the pre-activations (ReLU gate x dropout scale),
+        which is what backpropagation needs (dp_core_v5.backprop_deltas)."""
         z1 = X @ self.W1 + self.b1
-        a1 = np.maximum(0, z1)
+        g1 = (z1 > 0).astype(X.dtype)
         if training:
-            m1 = (np.random.rand(*a1.shape) > 0.3).astype(np.float32) / 0.7
-            a1 = a1 * m1
+            g1 = g1 * ((np.random.rand(*z1.shape) > 0.3).astype(np.float32) / 0.7)
+        a1 = z1 * g1
         z2 = a1 @ self.W2 + self.b2
-        a2 = np.maximum(0, z2)
+        g2 = (z2 > 0).astype(X.dtype)
         if training:
-            m2 = (np.random.rand(*a2.shape) > 0.2).astype(np.float32) / 0.8
-            a2 = a2 * m2
+            g2 = g2 * ((np.random.rand(*z2.shape) > 0.2).astype(np.float32) / 0.8)
+        a2 = z2 * g2
         z3 = a2 @ self.W3 + self.b3
         out = 1.0 / (1.0 + np.exp(-np.clip(z3, -20, 20)))
-        return out, (X, z1, a1, z2, a2, z3)
-
-    def _backward(self, y: np.ndarray, cache):
-        X, z1, a1, z2, a2, z3 = cache
-        out = 1.0 / (1.0 + np.exp(-np.clip(z3, -20, 20)))
-        n = len(X)
-
-        # Class-balanced weight: up-weight the minority positive class
-        n_pos = max(float(y.sum()), 1.0)
-        n_neg = max(float(n - n_pos), 1.0)
-        w = np.where(y > 0.5, n_neg / n_pos, 1.0)
-
-        dz3 = (out - y) * w / n            # (n, 1)
-        dW3 = a2.T @ dz3
-        db3 = dz3.sum(axis=0)
-
-        da2 = dz3 @ self.W3.T
-        dz2 = da2 * (z2 > 0)              # ReLU derivative
-        dW2 = a1.T @ dz2
-        db2 = dz2.sum(axis=0)
-
-        da1 = dz2 @ self.W2.T
-        dz1 = da1 * (z1 > 0)
-        dW1 = X.T @ dz1
-        db1 = dz1.sum(axis=0)
-
-        return [dW1, db1, dW2, db2, dW3, db3]
+        return out, (X, a1, a2, z3, g1, g2)
 
     def _apply_adam(self, grads, beta1: float = 0.9, beta2: float = 0.999,
                     eps: float = 1e-8):
@@ -267,7 +274,7 @@ class NumpyMLPWrapper:
             params[i] -= self.lr * m_hat / (np.sqrt(v_hat) + eps)
 
     # ------------------------------------------------------------------
-    # Public Keras-compatible interface
+    # Public interface
     # ------------------------------------------------------------------
 
     def predict(self, X, verbose=0) -> np.ndarray:
@@ -294,41 +301,14 @@ class NumpyMLPWrapper:
          self.W3, self.b3) = [np.array(w, dtype=np.float32) for w in weights[:6]]
         self._reset_adam()  # fresh Adam state after weight injection
 
-    def fit(self, X, y, **kwargs):
-        """One-epoch fit without DP (used as a plain fallback)."""
-        X = np.array(X, dtype=np.float32)
-        y = np.array(y, dtype=np.float32).reshape(-1, 1)
-        bs = 64
-        idx = np.random.permutation(len(X))
-        for b in range(max(1, len(X) // bs)):
-            s, e = b * bs, min((b + 1) * bs, len(X))
-            Xb, yb = X[idx[s:e]], y[idx[s:e]]
-            _, cache = self._forward(Xb, training=True)
-            grads = self._backward(yb, cache)
-            self._apply_adam(grads)
-        return self
-
     def count_params(self):
         return sum(p.size for p in self._params())
 
 
-def create_model(input_dim: int = dpc.N_FEATURES, learning_rate: float = Config.LEARNING_RATE):
-    if TF_AVAILABLE:
-        model = tf.keras.Sequential([
-            tf.keras.layers.Dense(64, activation="relu", input_shape=(input_dim,),
-                                  kernel_regularizer=tf.keras.regularizers.l2(0.01)),
-            tf.keras.layers.Dropout(0.3),
-            tf.keras.layers.Dense(32, activation="relu",
-                                  kernel_regularizer=tf.keras.regularizers.l2(0.01)),
-            tf.keras.layers.Dropout(0.2),
-            tf.keras.layers.Dense(1, activation="sigmoid", dtype="float32"),
-        ])
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-            loss="binary_crossentropy",
-            metrics=["accuracy", tf.keras.metrics.AUC(name="auc")],
-        )
-        return model
+def create_model(input_dim: int = dpc.N_FEATURES, learning_rate: Optional[float] = None):
+    # Read at call time so that harness overrides of Config.LEARNING_RATE apply.
+    if learning_rate is None:
+        learning_rate = Config.LEARNING_RATE
     return NumpyMLPWrapper(input_dim, learning_rate)
 
 
@@ -468,8 +448,9 @@ def load_mimic_data(mimic_path: str, cache_file: str, logger: logging.Logger) ->
                      "creatinine", "lactate", "wbc", "hemoglobin"]
     missing_frac = data[clinical_cols].isnull().mean(axis=1)
     data = data[missing_frac <= 0.5].copy()
-    for col in clinical_cols:
-        data[col].fillna(data[col].median(), inplace=True)
+    # Missing values are deliberately LEFT missing in the cache: imputation is
+    # part of preprocessing (public reference values; Config.PREPROCESSING),
+    # so that no cohort statistic is baked into the feature table.
 
     keep = ["stay_id", "subject_id", "hospital_id", "mortality",
             "age", "gender", "ethnicity", "insurance"] + clinical_cols
@@ -508,46 +489,15 @@ def generate_synthetic_data(n_samples: int = 94_458, seed: int = 0) -> pd.DataFr
 
 
 # ---------------------------------------------------------------------------
-# Differential Privacy
-# ---------------------------------------------------------------------------
-
-class ProperDPMechanism:
-    def __init__(self, epsilon: float, delta: float = Config.DELTA,
-                 clipping_norm: float = Config.CLIPPING_NORM):
-        self.epsilon = epsilon
-        self.delta = delta
-        self.clipping_norm = clipping_norm
-        self.noise_multiplier = np.sqrt(2 * np.log(1.25 / delta)) / epsilon
-
-    def clip_gradients(self, gradients):
-        total_norm = np.sqrt(sum(np.sum(g ** 2) for g in gradients))
-        clip_factor = min(1.0, self.clipping_norm / (total_norm + 1e-8))
-        return [g * clip_factor for g in gradients]
-
-    def add_noise(self, gradients, num_samples):
-        noise_std = (self.clipping_norm * self.noise_multiplier) / max(num_samples, 1)
-        return [g + np.random.normal(0, noise_std, g.shape) for g in gradients]
-
-    def privatize_gradients(self, gradients, num_samples):
-        return self.add_noise(self.clip_gradients(gradients), num_samples)
-
-
-# ---------------------------------------------------------------------------
 # Federated Client
 # ---------------------------------------------------------------------------
 
 class FederatedClient:
-    def __init__(self, client_id: int, client_data: pd.DataFrame, scaler):
+    def __init__(self, client_id: int, client_data: pd.DataFrame, preprocessor):
         self.client_id = client_id
         self.n_samples = len(client_data)
         self.mortality_rate = client_data["mortality"].mean()
-        X_raw, _, _ = dpc.encode_features(client_data)
-        nan_mask = np.isnan(X_raw)
-        if nan_mask.any():
-            col_medians = np.nanmedian(X_raw, axis=0)
-            X_raw[nan_mask] = np.take(col_medians, np.where(nan_mask)[1])
-        X_raw[:, :dpc.N_CONTINUOUS] = scaler.transform(X_raw[:, :dpc.N_CONTINUOUS])
-        self.X = X_raw.astype(np.float32)
+        self.X = preprocessor.transform(client_data)
         self.y = client_data["mortality"].values.astype(np.float32)
         self.ethnicity = client_data["ethnicity"].values
         self.gender = client_data["gender"].values
@@ -569,109 +519,307 @@ class FederatedClient:
 
 
 # ---------------------------------------------------------------------------
-# Config snapshot for worker processes
+# Federation construction (single source of truth for main run + harnesses)
 # ---------------------------------------------------------------------------
 
-def _make_cfg() -> dict:
+META_COLS = ["stay_id", "subject_id", "hospital_id", "mortality",
+             "ethnicity", "gender", "insurance"]
+
+
+def impute_features(data: pd.DataFrame, logger: Optional[logging.Logger] = None
+                    ) -> pd.DataFrame:
+    """Fill missing feature values with cohort medians computed before the
+    split. Used ONLY by the PREPROCESSING="cohort" ablation control: these
+    medians see validation/test rows and are not covered by the DP
+    guarantee. Returns a new frame."""
+    na_count = int(data[Config.FEATURE_COLS].isnull().sum().sum())
+    if na_count == 0:
+        return data
+    data = data.copy()
+    for col in Config.FEATURE_COLS:
+        data[col] = data[col].fillna(data[col].median())
+    if logger is not None:
+        logger.warning(f"Imputed {na_count} NaN values across feature columns.")
+    return data
+
+
+def make_preprocessor(logger: Optional[logging.Logger] = None):
+    if Config.PREPROCESSING == "reference":
+        return dpc.ReferencePreprocessor()
+    if Config.PREPROCESSING == "cohort":
+        if logger is not None:
+            logger.warning("PREPROCESSING='cohort': fitted statistics are NOT "
+                           "covered by the DP guarantee (ablation control only).")
+        return dpc.CohortPreprocessor()
+    raise ValueError(f"unknown PREPROCESSING {Config.PREPROCESSING!r}")
+
+
+def prepare_federation(data: pd.DataFrame, split_seed: int = 42,
+                       split_unit: str = "patient",
+                       design_fraction: Optional[float] = None,
+                       logger: Optional[logging.Logger] = None) -> Dict:
+    """Split the cohort 70/10/20 and build the federated clients.
+
+    split_unit="patient" (the protocol): partitions are drawn over
+    subject_id and each training patient is assigned to exactly one client
+    (modal care unit of their training stays). split_unit="stay" (leaky
+    control used by the split ablation): partitions are drawn over stays
+    and clients are the raw care units.
+
+    Within every client, a fraction `design_fraction` (default
+    Config.DESIGN_FRACTION) of the training units is set aside as the DESIGN
+    cohort, used only by the budget searches; the remainder is the
+    DEPLOYMENT cohort on which every reported model is trained. The two are
+    disjoint, so search runs spend no privacy budget of deployment patients.
+
+    Preprocessing follows Config.PREPROCESSING ("reference": public
+    constants only). Returns a dict with clients (deployment),
+    design_clients, X/y for the validation and test partitions, and per-row
+    metadata frames (meta_val / meta_test) aligned with those arrays.
+    """
+    if design_fraction is None:
+        design_fraction = Config.DESIGN_FRACTION
+    preprocessor = make_preprocessor(logger)
+    if Config.PREPROCESSING == "cohort":
+        data = impute_features(data, logger)
+    data = data.reset_index(drop=True)
+    if "subject_id" not in data.columns:
+        if logger is not None:
+            logger.warning("subject_id missing: treating each stay as its "
+                           "own subject.")
+        data = data.assign(subject_id=np.arange(len(data)))
+
+    if split_unit == "patient":
+        unit_of_row = data["subject_id"].values
+    elif split_unit == "stay":
+        unit_of_row = data.index.values
+    else:
+        raise ValueError(f"unknown split_unit {split_unit!r}")
+    units = np.sort(np.unique(unit_of_row))
+    perm = np.random.RandomState(split_seed).permutation(len(units))
+    n_test = int(round(Config.TEST_SIZE * len(units)))
+    n_val = int(round(Config.VAL_SIZE * len(units)))
+    test_units = units[perm[:n_test]]
+    val_units = units[perm[n_test:n_test + n_val]]
+    part = np.where(np.isin(unit_of_row, test_units), "test",
+                    np.where(np.isin(unit_of_row, val_units), "val", "train"))
+    data = data.assign(_partition=part, _unit=unit_of_row)
+    train_rows = data[data["_partition"] == "train"].copy()
+
+    if split_unit == "patient":
+        # Patient -> single client: modal care unit over the patient's
+        # training stays (ties broken by pandas value_counts order).
+        modal = (train_rows.groupby("subject_id")["hospital_id"]
+                 .agg(lambda s: s.value_counts().index[0]))
+        train_rows["client_id"] = train_rows["subject_id"].map(modal).astype(int)
+        if logger is not None:
+            moved = int((train_rows["client_id"] != train_rows["hospital_id"]).sum())
+            multi = int((train_rows.groupby("subject_id")["hospital_id"]
+                         .nunique() > 1).sum())
+            max_stays = int(train_rows.groupby(["client_id", "subject_id"])
+                            .size().max())
+            logger.info(f"Patient->client assignment: {multi:,} multi-unit "
+                        f"patients; {moved:,} stays reassigned "
+                        f"({100 * moved / len(train_rows):.1f}%); max "
+                        f"stays/patient within a client: {max_stays}")
+    else:
+        train_rows["client_id"] = train_rows["hospital_id"].astype(int)
+
+    # Design / deployment cohorts: disjoint sets of units within each client.
+    rng_design = np.random.RandomState(split_seed + 1000)
+    is_design = np.zeros(len(train_rows), dtype=bool)
+    client_ids = sorted(train_rows["client_id"].unique())[:Config.N_CLIENTS]
+    for i in client_ids:
+        in_client = (train_rows["client_id"] == i).values
+        c_units = np.sort(train_rows.loc[in_client, "_unit"].unique())
+        n_design = int(round(design_fraction * len(c_units)))
+        chosen = c_units[rng_design.permutation(len(c_units))[:n_design]]
+        is_design |= in_client & np.isin(train_rows["_unit"].values, chosen)
+    train_rows["_design"] = is_design
+
+    preprocessor.fit(train_rows[~train_rows["_design"]])
+
+    def _clients(rows: pd.DataFrame, label: str):
+        out = []
+        for i in client_ids:
+            cdf = rows[rows["client_id"] == i]
+            c = FederatedClient(int(i), cdf.reset_index(drop=True), preprocessor)
+            out.append(c)
+            if logger is not None:
+                logger.info(f"  {label} client {i}: {c.n_samples:,} stays "
+                            f"({cdf['subject_id'].nunique():,} patients), "
+                            f"mortality={c.mortality_rate:.1%}")
+        return out
+
+    clients = _clients(train_rows[~train_rows["_design"]], "Deployment")
+    design_clients = (_clients(train_rows[train_rows["_design"]], "Design")
+                      if design_fraction > 0 else clients)
+
+    def _extract(partition: str):
+        pdf = data[data["_partition"] == partition]
+        y = pdf["mortality"].values.astype(np.float32)
+        meta = pdf[[c for c in META_COLS if c in pdf.columns]].reset_index(drop=True)
+        return preprocessor.transform(pdf), y, meta
+
+    X_val, y_val, meta_val = _extract("val")
+    X_test, y_test, meta_test = _extract("test")
+    if logger is not None:
+        logger.info(f"{split_unit.capitalize()}-level split (seed {split_seed}) "
+                    f"-- train: {len(train_rows):,} stays "
+                    f"(design {int(is_design.sum()):,} / deployment "
+                    f"{int((~is_design).sum()):,}), val: {len(y_val):,}, "
+                    f"test: {len(y_test):,} ({len(units):,} {split_unit} units); "
+                    f"{dpc.N_FEATURES} features, {preprocessor.name} preprocessing")
     return {
-        "epsilon_max":      Config.EPSILON_MAX,
-        "epsilon_min":      Config.EPSILON_MIN,
-        "auc_min":          Config.AUC_MIN,
-        "sensitivity_min":  Config.SENSITIVITY_MIN,
-        "fairness_gap_max": Config.FAIRNESS_GAP_MAX,
-        "n_clients":        Config.N_CLIENTS,
-        "batch_size":       Config.BATCH_SIZE,
-        "local_epochs":     Config.LOCAL_EPOCHS,
-        "delta":            Config.DELTA,
-        "clipping_norm":    Config.CLIPPING_NORM,
-        "learning_rate":    Config.LEARNING_RATE,
-        "w_outcome":        Config.W_OUTCOME,
-        "w_group":          Config.W_GROUP,
-        "w_individual":     Config.W_INDIVIDUAL,
-        "w_client":         Config.W_CLIENT,
-        "w_system":         Config.W_SYSTEM,
+        "clients": clients, "design_clients": design_clients,
+        "preprocessor": preprocessor,
+        "X_val": X_val, "y_val": y_val, "meta_val": meta_val,
+        "X_test": X_test, "y_test": y_test, "meta_test": meta_test,
+        "split_seed": split_seed, "split_unit": split_unit,
+        "design_fraction": design_fraction,
     }
 
 
 # ---------------------------------------------------------------------------
-# Module-level worker functions (must be top-level to pickle with spawn)
+# Worker-process context
 # ---------------------------------------------------------------------------
+# The federation (client data, validation/test arrays) is installed once per
+# worker process by the pool initializer instead of being pickled into every
+# task, and the parent's Config is mirrored so that overrides (--fast,
+# harness settings) also hold under the "spawn" start method.
 
-def _v3_moop_eval_worker(args):
-    """Evaluate one individual for the v5 3-objective problem
-    (privacy, utility, fairness) on the validation split."""
-    (xi, clients, X_test, y_test,
-     eth_test, gen_test,
-     eval_rounds, seed, cfg) = args
+_CTX: dict = {}
 
-    trainer = HealthcareFLTrainer(clients, X_test, y_test, seed=seed)
+
+def _config_snapshot() -> dict:
+    return {k: getattr(Config, k) for k in dir(Config) if k.isupper()}
+
+
+def _init_worker(ctx: dict):
+    global _CTX
+    _CTX = ctx
+    for k, v in ctx.get("config", {}).items():
+        setattr(Config, k, v)
+
+
+def validation_folds(subject_id: np.ndarray, split_seed: int) -> np.ndarray:
+    """Two folds of the validation split, patients kept whole, for the
+    cross-fitted search constraints (dp_core_v5.crossfit_predictions)."""
+    uniq, inv = np.unique(subject_id, return_inverse=True)
+    rng = np.random.RandomState(split_seed + 2000)
+    return (rng.permutation(len(uniq)) % 2)[inv]
+
+
+def make_context(fed: dict) -> dict:
+    """Context shared with worker processes, built from prepare_federation()."""
+    return {
+        "clients": fed["clients"],                  # deployment cohort
+        "design_clients": fed["design_clients"],    # budget-search cohort
+        "X_val": fed["X_val"], "y_val": fed["y_val"],
+        "val_fold": validation_folds(fed["meta_val"]["subject_id"].values,
+                                     fed["split_seed"]),
+        "eth_val": fed["meta_val"]["ethnicity"].values,
+        "gen_val": fed["meta_val"]["gender"].values,
+        "X_test": fed["X_test"], "y_test": fed["y_test"],
+        "eth_test": fed["meta_test"]["ethnicity"].values,
+        "gen_test": fed["meta_test"]["gender"].values,
+        "config": _config_snapshot(),
+    }
+
+
+def make_pool(ctx: dict, n_jobs: int) -> Optional[Pool]:
+    """Install ctx in this process and in n_jobs workers (None if n_jobs<=1)."""
+    _init_worker(ctx)
+    if n_jobs <= 1:
+        return None
+    return Pool(n_jobs, initializer=_init_worker, initargs=(ctx,))
+
+
+def _pool_map(pool: Optional[Pool], fn, tasks: list) -> list:
+    if pool is not None and len(tasks) > 1:
+        return pool.map(fn, tasks, chunksize=1)
+    return [fn(t) for t in tasks]
+
+
+def _make_cfg() -> dict:
+    return {
+        "epsilon_max":      Config.EPSILON_MAX,
+        "auc_min":          Config.AUC_MIN,
+        "sensitivity_min":  Config.SENSITIVITY_MIN,
+        "fairness_gap_max": Config.FAIRNESS_GAP_MAX,
+        "fairness_objective": Config.FAIRNESS_OBJECTIVE,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Search fitness workers (top-level so they pickle under "spawn")
+# ---------------------------------------------------------------------------
+# Candidates are trained on the DESIGN cohort only, so a search spends no
+# privacy budget of the deployment patients. Fitness is computed on the
+# validation split, which also serves as the threshold-selection split
+# inside the worker's trainer. A failing evaluation raises: a silent
+# penalty value would corrupt the search.
+
+def _moop_eval_worker(args):
+    """One candidate of the 3-objective problem (privacy, utility, fairness)."""
+    xi, eval_rounds, seed, cfg = args
+    clients = _CTX["design_clients"]
+    X_s, y_s = _CTX["X_val"], _CTX["y_val"]
+
+    trainer = HealthcareFLTrainer(clients, X_s, y_s, seed=seed)
     trainer.reset(seed)
-
-    n_clients = len(clients)
     client_sizes = {c.client_id: c.n_samples for c in clients}
-    eps_alloc = {j: float(xi[j]) for j in range(n_clients)}
+    eps_alloc = {j: float(xi[j]) for j in range(len(clients))}
+    fairness_eval = FairnessEvaluator(pd.DataFrame(
+        {"ethnicity": _CTX["eth_val"], "gender": _CTX["gen_val"]}))
 
-    demographics = pd.DataFrame({"ethnicity": eth_test, "gender": gen_test})
-    fairness_eval = FairnessEvaluator(demographics)
+    result = trainer.train_federated(num_rounds=eval_rounds,
+                                     epsilon_allocations=eps_alloc)
+    m = result["final_metrics"]
+    y_true = y_s.flatten().astype(int)
+    # Decisions with a threshold chosen on OTHER validation patients.
+    y_pred = dpc.crossfit_predictions(m["prediction_probs"], y_true,
+                                      _CTX["val_fold"], Config.SENS_TARGET)
+    sens = float(y_pred[y_true == 1].mean())
+    fnr_gap = fairness_eval.max_fnr_gap(y_true, y_pred)
 
-    try:
-        result = trainer.train_federated(num_rounds=eval_rounds,
-                                         epsilon_allocations=eps_alloc)
-        m = result["final_metrics"]
-        y_true = y_test.flatten().astype(int)
+    f = np.zeros(3)
+    f[0] = float(np.mean(xi)) / cfg["epsilon_max"]
+    f[1] = 1.0 - m["auc"]
+    if cfg["fairness_objective"] == "fnr_gap":
+        f[2] = fnr_gap
+    else:
+        lv = fairness_eval.evaluate_all(
+            y_true, y_pred, m["prediction_probs"],
+            trainer.X_test, result["client_aucs"], eps_alloc, client_sizes)
+        f[2] = (three_level_unfairness(lv)
+                if cfg["fairness_objective"] == "three_level"
+                else lv["fairness_unified"])
 
-        f = np.zeros(3)
-        f[0] = float(np.mean(xi)) / cfg["epsilon_max"]
-        f[1] = 1.0 - m["auc"]
-        fairness = fairness_eval.evaluate_all(
-            y_true, m["predictions"], m["prediction_probs"],
-            trainer.X_test, result["client_aucs"], eps_alloc, client_sizes,
-        )
-        f[2] = fairness["fairness_unified"]
-
-        g = np.zeros(3)
-        g[0] = cfg["sensitivity_min"] - m["sensitivity"]
-        g[1] = cfg["auc_min"] - m["auc"]
-        g[2] = (fairness_eval.max_fnr_gap(y_true, m["predictions"])
-                - cfg["fairness_gap_max"])
-        return f, g
-    except Exception:
-        return np.ones(3), np.ones(3)
+    g = np.zeros(3)
+    g[0] = cfg["sensitivity_min"] - sens
+    g[1] = cfg["auc_min"] - m["auc"]
+    g[2] = fnr_gap - cfg["fairness_gap_max"]
+    return f, g
 
 
-def _v3_mo_privacy_eval_worker(args):
-    xi, clients, X_test, y_test, eval_rounds, seed, cfg = args
-    trainer = HealthcareFLTrainer(clients, X_test, y_test, seed=seed)
+def _mo_privacy_eval_worker(args):
+    """One candidate of the 2-objective ablation (privacy, utility)."""
+    xi, eval_rounds, seed, cfg = args
+    trainer = HealthcareFLTrainer(_CTX["design_clients"], _CTX["X_val"],
+                                  _CTX["y_val"], seed=seed)
     trainer.reset(seed)
     eps_alloc = {j: float(xi[j]) for j in range(len(xi))}
-    try:
-        result = trainer.train_federated(num_rounds=eval_rounds, epsilon_allocations=eps_alloc)
-        m = result["final_metrics"]
-        f = np.array([float(np.mean(xi)) / cfg["epsilon_max"], 1.0 - m["auc"]])
-        g = np.array([cfg["sensitivity_min"] - m["sensitivity"], cfg["auc_min"] - m["auc"]])
-        return f, g
-    except Exception:
-        return np.ones(2), np.ones(2)
-
-
-def _v3_mo_efficiency_eval_worker(args):
-    xi, clients, X_test, y_test, eval_rounds, seed, cfg = args
-    trainer = HealthcareFLTrainer(clients, X_test, y_test, seed=seed)
-    trainer.reset(seed)
-    eps_alloc = {j: float(xi[j]) for j in range(len(xi))}
-    try:
-        t0 = time.time()
-        result = trainer.train_federated(num_rounds=eval_rounds, epsilon_allocations=eps_alloc)
-        elapsed = time.time() - t0
-        m = result["final_metrics"]
-        comm = (sum(w.nbytes for w in trainer.global_model.get_weights()) / 1e6
-                if trainer.global_model else 0.01)
-        f = np.array([0.4 * min(comm / 10, 1.0) + 0.6 * min(elapsed / 60, 1.0),
-                      1.0 - m["auc"]])
-        g = np.array([cfg["auc_min"] - m["auc"]])
-        return f, g
-    except Exception:
-        return np.ones(2), np.ones(1)
+    result = trainer.train_federated(num_rounds=eval_rounds,
+                                     epsilon_allocations=eps_alloc)
+    m = result["final_metrics"]
+    y_true = _CTX["y_val"].flatten().astype(int)
+    y_pred = dpc.crossfit_predictions(m["prediction_probs"], y_true,
+                                      _CTX["val_fold"], Config.SENS_TARGET)
+    f = np.array([float(np.mean(xi)) / cfg["epsilon_max"], 1.0 - m["auc"]])
+    g = np.array([cfg["sensitivity_min"] - float(y_pred[y_true == 1].mean()),
+                  cfg["auc_min"] - m["auc"]])
+    return f, g
 
 
 # ---------------------------------------------------------------------------
@@ -691,45 +839,125 @@ class HealthcareFLTrainer:
         self.seed = seed
         self.global_model = None
         self.training_history: List[Dict] = []
-        # Global class weight (train partition only): w_pos = n_neg / n_pos
-        all_y = np.concatenate([c.y for c in clients])
-        n_pos = max(float(all_y.sum()), 1.0)
-        self.w_pos = float(max(len(all_y) - n_pos, 1.0) / n_pos)
+        # Positive-class weight w_pos = n_neg / n_pos.
+        if Config.CLASS_WEIGHT == "prior":
+            # From a public prevalence prior: no label statistic is released.
+            self.w_pos = float((1.0 - Config.MORTALITY_PRIOR) / Config.MORTALITY_PRIOR)
+        elif Config.CLASS_WEIGHT == "pooled":
+            # Original submission (ablation control): pooled training labels,
+            # a data-dependent statistic outside the DP accountant.
+            all_y = np.concatenate([c.y for c in clients])
+            n_pos = max(float(all_y.sum()), 1.0)
+            self.w_pos = float(max(len(all_y) - n_pos, 1.0) / n_pos)
+        else:
+            raise ValueError(f"unknown CLASS_WEIGHT {Config.CLASS_WEIGHT!r}")
 
     def reset(self, seed: Optional[int] = None):
         if seed is not None:
             self.seed = seed
         np.random.seed(self.seed)
-        if TF_AVAILABLE:
-            tf.random.set_seed(self.seed)
         self.global_model = None
         self.training_history = []
+
+    @staticmethod
+    def dp_schedule(n_units: int) -> Tuple[float, int, int]:
+        """(q, steps_per_epoch, total_steps) of the certified protocol for a
+        client with n_units privacy units (patients, or stays at record
+        level) in its local training set. Each step Poisson-samples units at
+        rate q = B / n_units. total_steps always refers to the FULL
+        GLOBAL_ROUNDS protocol, the horizon sigma is calibrated to."""
+        bs = Config.BATCH_SIZE
+        q = min(1.0, bs / n_units)
+        steps_per_epoch = max(1, int(np.ceil(n_units / bs)))
+        total_steps = Config.GLOBAL_ROUNDS * Config.LOCAL_EPOCHS * steps_per_epoch
+        return q, steps_per_epoch, total_steps
+
+    def _local_units(self, client: FederatedClient):
+        """(train mask, unit index of each local training row or None,
+        number of privacy units) for this trainer's seed."""
+        tr_mask, _ = client.local_split_masks(seed=self.seed)
+        if Config.PRIVACY_UNIT == "patient":
+            uniq, unit = np.unique(client.subjects[tr_mask], return_inverse=True)
+            return tr_mask, unit, int(len(uniq))
+        if Config.PRIVACY_UNIT == "record":
+            return tr_mask, None, int(tr_mask.sum())
+        raise ValueError(f"unknown PRIVACY_UNIT {Config.PRIVACY_UNIT!r}")
+
+    def privacy_report(self, epsilon_allocations: Optional[Dict]) -> Dict:
+        """Per-client mechanism parameters actually used for an allocation:
+        budget, calibrated sigma, sampling rate, certified step count, and
+        the number of local training records, patients and privacy units."""
+        report = {}
+        for client in self.clients:
+            eps = (epsilon_allocations or {}).get(client.client_id, 1e6)
+            tr_mask, _, n_units = self._local_units(client)
+            entry = {"n_local": int(tr_mask.sum()),
+                     "n_patients_local": int(len(np.unique(client.subjects[tr_mask]))),
+                     "n_units": n_units, "privacy_unit": Config.PRIVACY_UNIT}
+            if eps >= NONPRIVATE_EPS:
+                entry.update(epsilon=float("inf"), sigma=0.0, q=float("nan"),
+                             total_steps=0)
+            else:
+                q, _, total_steps = self.dp_schedule(n_units)
+                entry.update(epsilon=float(eps), q=float(q),
+                             total_steps=int(total_steps),
+                             sigma=float(dpc.calibrate_sigma_cached(
+                                 eps, Config.DELTA, q, total_steps)))
+            if Config.NOISE_SCALE != 1.0:   # ablation run: no certificate
+                entry.update(certified=False, noise_scale=Config.NOISE_SCALE)
+            report[client.client_id] = entry
+        return report
+
+    def composed_epsilon(self, runs: List[Tuple[Dict, int]]) -> Dict:
+        """Per-client epsilon of the COMPOSITION of several training runs on
+        this trainer's clients. `runs` is a list of (allocation, rounds):
+        each run uses the sigma calibrated for its allocation over the full
+        protocol but executes only `rounds` rounds. This is what a party
+        observing all of the runs (e.g. a whole budget search) learns."""
+        out = {}
+        for client in self.clients:
+            _, _, n_units = self._local_units(client)
+            q, steps_per_epoch, total_steps = self.dp_schedule(n_units)
+            triples = []
+            for alloc, rounds in runs:
+                eps = alloc.get(client.client_id, 1e6)
+                if eps >= NONPRIVATE_EPS:
+                    return {c.client_id: float("inf") for c in self.clients}
+                sigma = dpc.calibrate_sigma_cached(eps, Config.DELTA, q, total_steps)
+                triples.append((q, sigma, rounds * Config.LOCAL_EPOCHS * steps_per_epoch))
+            out[client.client_id] = dpc.eps_from_rdp_runs(triples, Config.DELTA)
+        return out
 
     def local_training_with_dp(self, client: FederatedClient,
                                 global_weights, epsilon: float,
                                 local_epochs: Optional[int] = None):
-        """v5: certified DP-SGD (record-level adjacency).
+        """Certified DP-SGD at the configured privacy unit.
 
-        Private path (epsilon < NONPRIVATE_EPS): Poisson sampling at rate
-        q = B / n_local, per-example l2 clipping to C, Gaussian noise on the
-        per-step SUM; the noise multiplier is calibrated once per
-        (epsilon, q, steps) by the RDP accountant so that the FULL protocol
-        (GLOBAL_ROUNDS x LOCAL_EPOCHS x steps_per_epoch steps) satisfies the
-        client's total (epsilon, delta)-DP budget. The identical sigma is
-        used during reduced-round search evaluations, which therefore
-        consume only part of the certified budget.
+        Private path (epsilon < NONPRIVATE_EPS): each step Poisson-samples
+        privacy units at rate q = B / n_units. With PRIVACY_UNIT="patient"
+        a sampled patient contributes ALL of their local stays and the SUM
+        of those stays' gradients is l2-clipped to C, so adding or removing
+        one patient changes the summed update by at most C (patient-level
+        adjacency). With "record" every stay is its own unit. Gaussian noise
+        N(0, (sigma*C)^2) is added to the per-step sum. The noise multiplier
+        is calibrated once per (epsilon, q, steps) by the RDP accountant so
+        that the FULL protocol (GLOBAL_ROUNDS x LOCAL_EPOCHS x
+        steps_per_epoch steps) satisfies the client's total
+        (epsilon, delta)-DP budget.
         Non-private path: standard minibatch SGD, no clipping, no noise.
         """
         if local_epochs is None:
             local_epochs = Config.LOCAL_EPOCHS
 
-        local_model = create_model()
+        local_model = create_model(
+            learning_rate=(Config.LEARNING_RATE if epsilon >= NONPRIVATE_EPS
+                           else Config.DP_LEARNING_RATE))
         if global_weights is not None:
             local_model.set_weights(global_weights)
 
-        X_train, X_val, y_train, y_val = client.get_train_test_split(seed=self.seed)
-        y_train = y_train.reshape(-1, 1)
-        y_val = y_val.reshape(-1, 1)
+        tr_mask, unit, n_units = self._local_units(client)
+        X_train, y_train = client.X[tr_mask], client.y[tr_mask].reshape(-1, 1)
+        X_val, y_val = client.X[~tr_mask], client.y[~tr_mask].reshape(-1, 1)
         n_local = len(X_train)
         w_pos = self.w_pos
         rng = np.random.default_rng(np.random.randint(0, 2**31 - 1))
@@ -743,26 +971,23 @@ class HealthcareFLTrainer:
                     s, e = b * bs, min((b + 1) * bs, n_local)
                     Xb, yb = X_train[indices[s:e]], y_train[indices[s:e]]
                     _, cache = local_model._forward(Xb, training=True)
-                    peg = dpc.per_example_grads(local_model, yb, cache, w_pos)
-                    grads = [g.sum(axis=0) / len(Xb) for g in peg]
-                    local_model._apply_adam(grads)
+                    local_model._apply_adam(
+                        dpc.batch_grads(local_model, yb, cache, w_pos))
         else:
-            q = min(1.0, bs / n_local)
-            steps_per_epoch = max(1, int(np.ceil(n_local / bs)))
-            total_steps = (Config.GLOBAL_ROUNDS * Config.LOCAL_EPOCHS
-                           * steps_per_epoch)
+            q, steps_per_epoch, total_steps = self.dp_schedule(n_units)
             sigma = dpc.calibrate_sigma_cached(epsilon, Config.DELTA, q,
-                                               total_steps)
+                                               total_steps) * Config.NOISE_SCALE
             C = Config.CLIPPING_NORM
             for _ in range(local_epochs * steps_per_epoch):
-                mask = rng.random(n_local) < q
-                if not mask.any():
+                sampled = rng.random(n_units) < q
+                if not sampled.any():
                     continue
+                mask = sampled if unit is None else sampled[unit]
                 Xb, yb = X_train[mask], y_train[mask]
                 _, cache = local_model._forward(Xb, training=True)
-                peg = dpc.per_example_grads(local_model, yb, cache, w_pos)
-                grads = dpc.clip_and_noise(peg, C, sigma, bs, rng)
-                local_model._apply_adam(grads)
+                local_model._apply_adam(dpc.clipped_noisy_grads(
+                    local_model, yb, cache, w_pos, C, sigma, bs, rng,
+                    groups=None if unit is None else unit[mask]))
 
         val_loss, val_acc, val_auc = local_model.evaluate(X_val, y_val, verbose=0)
         return local_model.get_weights(), {
@@ -805,6 +1030,7 @@ class HealthcareFLTrainer:
         tau = dpc.select_threshold(val_probs, y_thr, Config.SENS_TARGET)
         probs = self.global_model.predict(self.X_test, verbose=0).flatten()
         m = dpc.threshold_metrics(self.y_test, probs, tau)
+        m["val_probs"] = val_probs
         y_f = self.y_test.ravel()
         m["loss"] = float(-np.mean(y_f * np.log(probs + 1e-8)
                                    + (1 - y_f) * np.log(1 - probs + 1e-8)))
@@ -904,17 +1130,31 @@ class FairnessEvaluator:
         return max(0.0, 1.0 - 0.5 * (avg_dp + avg_eo))
 
     def individual_level(self, X_test: np.ndarray, y_pred_prob: np.ndarray,
-                         k: int = 10, n_sub: int = 5000) -> float:
-        """Local prediction consistency (v5): 1 - mean absolute prediction
-        difference among the k nearest neighbours in NON-PROTECTED feature
-        space (continuous clinical features only). Seeded for determinism;
-        bounded in [0, 1] without the variance-metric floor."""
+                         k: int = 10, n_sub: int = 5000,
+                         scale: str = "rank") -> float:
+        """Local prediction consistency: 1 - mean absolute score difference
+        among the k nearest neighbours in NON-PROTECTED feature space
+        (continuous clinical features only). Seeded for determinism.
+
+        scale="rank" (default) compares the scores' percentile ranks within
+        the evaluated cohort, so the value is unchanged by any monotone
+        rescaling of the model output. scale="raw" compares raw
+        probabilities (the submitted definition): a model whose scores are
+        all close to zero then looks consistent merely because its scores
+        have a small range, which is why the raw value is reported only as
+        a documented artefact."""
         from sklearn.neighbors import NearestNeighbors
+        from scipy.stats import rankdata
         rng = np.random.default_rng(0)
         n = min(len(X_test), n_sub)
         idx = rng.choice(len(X_test), n, replace=False)
         X_sub = X_test[idx][:, :dpc.N_CONTINUOUS]
-        p_sub = y_pred_prob.flatten()[idx]
+        scores = y_pred_prob.flatten()
+        if scale == "rank":
+            scores = rankdata(scores) / len(scores)
+        elif scale != "raw":
+            raise ValueError(f"unknown scale {scale!r}")
+        p_sub = scores[idx]
         nn = NearestNeighbors(n_neighbors=k + 1, algorithm="ball_tree").fit(X_sub)
         _, indices = nn.kneighbors(X_sub)
         diffs = np.abs(p_sub[indices[:, 1:]] - p_sub[:, None])
@@ -976,7 +1216,20 @@ class FairnessEvaluator:
             "fairness_client": float(f_client), "fairness_group": float(f_group),
             "fairness_individual": float(f_individual), "fairness_system": float(f_system),
             "fairness_outcome": float(f_outcome), "fairness_unified": float(1.0 - unified),
+            "fairness_individual_raw": float(
+                self.individual_level(X_test, y_pred_prob, scale="raw")),
+            "max_fnr_gap": float(self.max_fnr_gap(y_true, y_pred)),
         }
+
+
+def three_level_unfairness(levels: Dict) -> float:
+    """Composite without the individual and system levels: outcome, group
+    and client levels with their original weights renormalised to sum to 1.
+    Used for the objective sensitivity analysis (reviewer comment R2.5)."""
+    w = Config.W_OUTCOME + Config.W_GROUP + Config.W_CLIENT
+    return float(1.0 - (Config.W_OUTCOME * levels["fairness_outcome"]
+                        + Config.W_GROUP * levels["fairness_group"]
+                        + Config.W_CLIENT * levels["fairness_client"]) / w)
 
 
 # ---------------------------------------------------------------------------
@@ -1001,22 +1254,7 @@ def run_fixed_eps(trainer: HealthcareFLTrainer, epsilon: float, seed: int = 42) 
     return result
 
 
-def run_dpsgd_standalone(trainer: HealthcareFLTrainer, epsilon: float = 1.0,
-                          seed: int = 42) -> Dict:
-    trainer.reset(seed)
-    n_avg = np.mean([c.n_samples for c in trainer.clients])
-    total_steps = Config.GLOBAL_ROUNDS * Config.LOCAL_EPOCHS * int(n_avg * 0.8 / Config.BATCH_SIZE)
-    eps_per_step = epsilon / np.sqrt(2 * total_steps * np.log(1 / Config.DELTA))
-    eps = {c.client_id: max(eps_per_step * np.sqrt(total_steps / Config.GLOBAL_ROUNDS), 0.1)
-           for c in trainer.clients}
-    result = trainer.train_federated(num_rounds=Config.GLOBAL_ROUNDS, epsilon_allocations=eps)
-    result["method"] = f"DP-SGD(eps={epsilon})"
-    result["avg_epsilon"] = epsilon
-    return result
-
-
 def run_fairfed(trainer: HealthcareFLTrainer, seed: int = 42, lambda_fair: float = 1.0) -> Dict:
-    from sklearn.model_selection import train_test_split as tts
     trainer.reset(seed)
 
     def _agg(updates, rnd, t):
@@ -1069,6 +1307,9 @@ def run_fcfl(trainer: HealthcareFLTrainer, seed: int = 42) -> Dict:
     yf = trainer.y_test.ravel()
     m["loss"] = float(-np.mean(yf * np.log(cal_test + 1e-8)
                                + (1 - yf) * np.log(1 - cal_test + 1e-8)))
+    m["val_probs"] = cal_val
+    m["raw_val_probs"] = val_probs
+    m["raw_test_probs"] = raw_test
     result["final_metrics"] = m
     result["method"] = "FCFL"
     result["avg_epsilon"] = float("inf")
@@ -1076,13 +1317,31 @@ def run_fcfl(trainer: HealthcareFLTrainer, seed: int = 42) -> Dict:
 
 
 # ---------------------------------------------------------------------------
-# MO-Privacy (parallel)
+# Budget-allocation searches (NSGA-II and the LHS control)
 # ---------------------------------------------------------------------------
+# All searches read the federation from the worker context (make_pool).
+# Candidates are trained on the DESIGN cohort and scored on the validation
+# split; the selected allocation is then trained once, for the full
+# protocol, on the DEPLOYMENT cohort (the `trainer` argument). Each search
+# returns that model, the complete archive (every evaluated allocation with
+# its objectives and constraints) and the composed privacy cost of the
+# search on the design cohort.
 
-def run_mo_privacy(trainer: HealthcareFLTrainer, seed: int = 42,
-                   pool: Optional[Pool] = None,
-                   search_eval: Optional[tuple] = None) -> Dict:
+HV_REF_POINT = np.array([1.1, 0.5, 0.5])
+
+
+def _best_compromise(F: np.ndarray) -> int:
+    """Index of the solution minimizing the sum of max-normalized objectives."""
+    F_norm = F / (F.max(axis=0) + 1e-8)
+    return int(np.argmin(F_norm.sum(axis=1)))
+
+
+def _run_nsga2(worker, n_obj: int, n_constr: int, seed: int,
+               pool: Optional[Pool]):
+    """NSGA-II over per-client budgets. Returns (pymoo result, archive,
+    per-generation population objectives)."""
     from pymoo.algorithms.moo.nsga2 import NSGA2
+    from pymoo.core.callback import Callback
     from pymoo.core.problem import Problem
     from pymoo.optimize import minimize
     from pymoo.operators.crossover.sbx import SBX
@@ -1090,196 +1349,17 @@ def run_mo_privacy(trainer: HealthcareFLTrainer, seed: int = 42,
     from pymoo.operators.sampling.rnd import FloatRandomSampling
 
     cfg = _make_cfg()
-    if search_eval is not None:
-        X_search, y_search = search_eval[0], search_eval[1]
-    else:
-        X_search, y_search = trainer.X_test, trainer.y_test
+    archive = {"X": [], "F": [], "G": []}
 
     class _Prob(Problem):
-        def __init__(self, trainer, pool, cfg):
-            super().__init__(n_var=Config.N_CLIENTS, n_obj=2, n_constr=2,
+        def __init__(self):
+            super().__init__(n_var=Config.N_CLIENTS, n_obj=n_obj,
+                             n_constr=n_constr,
                              xl=Config.EPSILON_MIN, xu=Config.EPSILON_MAX)
-            self.clients = trainer.clients
-            self.X_test = X_search
-            self.y_test = y_search
-            self.pool = pool
-            self.cfg = cfg
             self.cache: Dict = {}
 
         def _evaluate(self, X, out, *args, **kwargs):
-            n = len(X)
-            F, G = np.zeros((n, 2)), np.zeros((n, 2))
-            to_eval = [(i, xi) for i, xi in enumerate(X)
-                       if tuple(np.round(xi, 2)) not in self.cache]
-            for i, xi in enumerate(X):
-                key = tuple(np.round(xi, 2))
-                if key in self.cache:
-                    F[i], G[i] = self.cache[key]
-            if to_eval:
-                tasks = [(xi, self.clients, self.X_test, self.y_test,
-                          Config.EVAL_ROUNDS, seed, self.cfg)
-                         for (_, xi) in to_eval]
-                raw = (self.pool.map(_v3_mo_privacy_eval_worker, tasks)
-                       if self.pool and len(tasks) > 1
-                       else [_v3_mo_privacy_eval_worker(t) for t in tasks])
-                for (i, xi), (fi, gi) in zip(to_eval, raw):
-                    F[i], G[i] = fi, gi
-                    self.cache[tuple(np.round(xi, 2))] = (fi.copy(), gi.copy())
-            out["F"], out["G"] = F, G
-
-    trainer.reset(seed)
-    prob = _Prob(trainer, pool, cfg)
-    algo = NSGA2(pop_size=Config.POP_SIZE, n_offsprings=Config.N_OFFSPRINGS,
-                 sampling=FloatRandomSampling(), crossover=SBX(prob=0.9, eta=15),
-                 mutation=PM(eta=20), eliminate_duplicates=True)
-    res = minimize(prob, algo, termination=("n_gen", Config.N_GENERATIONS),
-                   seed=seed, verbose=False)
-
-    if res.X is not None and len(res.X) > 0:
-        F_norm = res.F / (res.F.max(axis=0) + 1e-8)
-        best_idx = int(np.argmin(F_norm.sum(axis=1)))
-        best_eps = {j: res.X[best_idx, j] for j in range(Config.N_CLIENTS)}
-        trainer.reset(seed)
-        result = trainer.train_federated(num_rounds=Config.GLOBAL_ROUNDS,
-                                          epsilon_allocations=best_eps)
-        result["pareto_X"] = res.X
-        result["pareto_F"] = res.F
-    else:
-        result = run_fixed_eps(trainer, 1.0, seed)
-        best_eps = {j: 1.0 for j in range(Config.N_CLIENTS)}
-        result["pareto_X"] = None
-        result["pareto_F"] = None
-
-    result["method"] = "MO-Privacy"
-    result["avg_epsilon"] = float(np.mean(list(best_eps.values())))
-    return result
-
-
-# ---------------------------------------------------------------------------
-# MO-Efficiency (parallel)
-# ---------------------------------------------------------------------------
-
-def run_mo_efficiency(trainer: HealthcareFLTrainer, seed: int = 42,
-                      pool: Optional[Pool] = None,
-                      search_eval: Optional[tuple] = None) -> Dict:
-    from pymoo.algorithms.moo.nsga2 import NSGA2
-    from pymoo.core.problem import Problem
-    from pymoo.optimize import minimize
-    from pymoo.operators.crossover.sbx import SBX
-    from pymoo.operators.mutation.pm import PM
-    from pymoo.operators.sampling.rnd import FloatRandomSampling
-
-    cfg = _make_cfg()
-    if search_eval is not None:
-        X_search, y_search = search_eval[0], search_eval[1]
-    else:
-        X_search, y_search = trainer.X_test, trainer.y_test
-
-    class _Prob(Problem):
-        def __init__(self, trainer, pool, cfg):
-            super().__init__(n_var=Config.N_CLIENTS, n_obj=2, n_constr=1,
-                             xl=Config.EPSILON_MIN, xu=Config.EPSILON_MAX)
-            self.clients = trainer.clients
-            self.X_test = X_search
-            self.y_test = y_search
-            self.pool = pool
-            self.cfg = cfg
-            self.cache: Dict = {}
-
-        def _evaluate(self, X, out, *args, **kwargs):
-            n = len(X)
-            F, G = np.zeros((n, 2)), np.zeros((n, 1))
-            to_eval = [(i, xi) for i, xi in enumerate(X)
-                       if tuple(np.round(xi, 2)) not in self.cache]
-            for i, xi in enumerate(X):
-                key = tuple(np.round(xi, 2))
-                if key in self.cache:
-                    F[i], G[i] = self.cache[key]
-            if to_eval:
-                tasks = [(xi, self.clients, self.X_test, self.y_test,
-                          Config.EVAL_ROUNDS, seed, self.cfg)
-                         for (_, xi) in to_eval]
-                raw = (self.pool.map(_v3_mo_efficiency_eval_worker, tasks)
-                       if self.pool and len(tasks) > 1
-                       else [_v3_mo_efficiency_eval_worker(t) for t in tasks])
-                for (i, xi), (fi, gi) in zip(to_eval, raw):
-                    F[i], G[i] = fi, gi
-                    self.cache[tuple(np.round(xi, 2))] = (fi.copy(), gi.copy())
-            out["F"], out["G"] = F, G
-
-    trainer.reset(seed)
-    prob = _Prob(trainer, pool, cfg)
-    algo = NSGA2(pop_size=Config.POP_SIZE, n_offsprings=Config.N_OFFSPRINGS,
-                 sampling=FloatRandomSampling(), crossover=SBX(prob=0.9, eta=15),
-                 mutation=PM(eta=20), eliminate_duplicates=True)
-    res = minimize(prob, algo, termination=("n_gen", Config.N_GENERATIONS),
-                   seed=seed, verbose=False)
-
-    if res.X is not None and len(res.X) > 0:
-        F_norm = res.F / (res.F.max(axis=0) + 1e-8)
-        best_idx = int(np.argmin(F_norm.sum(axis=1)))
-        best_eps = {j: res.X[best_idx, j] for j in range(Config.N_CLIENTS)}
-        trainer.reset(seed)
-        result = trainer.train_federated(num_rounds=Config.GLOBAL_ROUNDS,
-                                          epsilon_allocations=best_eps)
-        result["pareto_X"] = res.X
-        result["pareto_F"] = res.F
-    else:
-        result = run_fixed_eps(trainer, 1.0, seed)
-        best_eps = {j: 1.0 for j in range(Config.N_CLIENTS)}
-        result["pareto_X"] = None
-        result["pareto_F"] = None
-
-    result["method"] = "MO-Efficiency"
-    result["avg_epsilon"] = float(np.mean(list(best_eps.values())))
-    return result
-
-
-# ---------------------------------------------------------------------------
-# MOOP-HealthFL 4-objective (parallel)
-# ---------------------------------------------------------------------------
-
-def run_moop_healthfl(trainer: HealthcareFLTrainer,
-                      fairness_evaluator: FairnessEvaluator,
-                      seed: int = 42,
-                      pool: Optional[Pool] = None,
-                      logger: logging.Logger = None,
-                      search_eval: Optional[tuple] = None) -> Dict:
-    from pymoo.algorithms.moo.nsga2 import NSGA2
-    from pymoo.core.problem import Problem
-    from pymoo.optimize import minimize
-    from pymoo.operators.crossover.sbx import SBX
-    from pymoo.operators.mutation.pm import PM
-    from pymoo.operators.sampling.rnd import FloatRandomSampling
-
-    if logger is None:
-        logger = log
-
-    cfg = _make_cfg()
-    if search_eval is not None:
-        # v4: fitness evaluated on the held-out validation split; the test
-        # set is reserved for final reporting only.
-        X_search, y_search, eth_test, gen_test = search_eval
-    else:
-        X_search, y_search = trainer.X_test, trainer.y_test
-        eth_test = fairness_evaluator.demographics["ethnicity"].values
-        gen_test = fairness_evaluator.demographics["gender"].values
-
-    class _MOOPProblem(Problem):
-        def __init__(self, trainer, pool, cfg):
-            super().__init__(n_var=Config.N_CLIENTS, n_obj=3, n_constr=3,
-                             xl=Config.EPSILON_MIN, xu=Config.EPSILON_MAX)
-            self.clients = trainer.clients
-            self.X_test = X_search
-            self.y_test = y_search
-            self.pool = pool
-            self.cfg = cfg
-            self.cache: Dict = {}
-            self.eval_count = 0
-
-        def _evaluate(self, X, out, *args, **kwargs):
-            n = len(X)
-            F, G = np.zeros((n, 3)), np.zeros((n, 3))
+            F, G = np.zeros((len(X), n_obj)), np.zeros((len(X), n_constr))
             to_eval = []
             for i, xi in enumerate(X):
                 key = tuple(np.round(xi, 2))
@@ -1287,32 +1367,16 @@ def run_moop_healthfl(trainer: HealthcareFLTrainer,
                     F[i], G[i] = self.cache[key]
                 else:
                     to_eval.append((i, xi))
-                    self.eval_count += 1
-
-            if to_eval:
-                tasks = [
-                    (xi, self.clients, self.X_test, self.y_test,
-                     eth_test, gen_test,
-                     Config.EVAL_ROUNDS, seed, self.cfg)
-                    for (_, xi) in to_eval
-                ]
-                raw = (self.pool.map(_v3_moop_eval_worker, tasks)
-                       if self.pool and len(tasks) > 1
-                       else [_v3_moop_eval_worker(t) for t in tasks])
-                for (i, xi), (fi, gi) in zip(to_eval, raw):
-                    F[i], G[i] = fi, gi
-                    self.cache[tuple(np.round(xi, 2))] = (fi.copy(), gi.copy())
-
+            raw = _pool_map(pool, worker,
+                            [(xi, Config.EVAL_ROUNDS, seed, cfg)
+                             for (_, xi) in to_eval])
+            for (i, xi), (fi, gi) in zip(to_eval, raw):
+                F[i], G[i] = fi, gi
+                self.cache[tuple(np.round(xi, 2))] = (fi.copy(), gi.copy())
+                archive["X"].append(np.array(xi, dtype=float))
+                archive["F"].append(fi.copy())
+                archive["G"].append(gi.copy())
             out["F"], out["G"] = F, G
-
-    trainer.reset(seed)
-    n_workers = pool._processes if pool is not None else 1
-    logger.info(f"  [MOOP] NSGA-II pop={Config.POP_SIZE}, gen={Config.N_GENERATIONS}, "
-                f"eval_rounds={Config.EVAL_ROUNDS}, workers={n_workers}")
-
-    prob = _MOOPProblem(trainer, pool, cfg)
-
-    from pymoo.core.callback import Callback
 
     class _GenLog(Callback):
         def __init__(self):
@@ -1322,114 +1386,256 @@ def run_moop_healthfl(trainer: HealthcareFLTrainer,
         def notify(self, algorithm):
             self.gen_F.append(np.array(algorithm.pop.get("F")))
 
-    _genlog = _GenLog()
+    genlog = _GenLog()
     algo = NSGA2(pop_size=Config.POP_SIZE, n_offsprings=Config.N_OFFSPRINGS,
                  sampling=FloatRandomSampling(), crossover=SBX(prob=0.9, eta=15),
                  mutation=PM(eta=20), eliminate_duplicates=True)
-    res = minimize(prob, algo, termination=("n_gen", Config.N_GENERATIONS),
-                   seed=seed, verbose=False, callback=_genlog)
+    res = minimize(_Prob(), algo, termination=("n_gen", Config.N_GENERATIONS),
+                   seed=seed, verbose=False, callback=genlog)
+    return res, {k: np.array(v) for k, v in archive.items()}, genlog.gen_F
 
-    if res.X is not None and len(res.X) > 0:
-        F_norm = res.F / (res.F.max(axis=0) + 1e-8)
-        best_idx = int(np.argmin(F_norm.sum(axis=1)))
-        best_eps = {j: res.X[best_idx, j] for j in range(Config.N_CLIENTS)}
 
-        logger.info("  [MOOP] Running full training with best allocation...")
-        trainer.reset(seed)
-        result = trainer.train_federated(num_rounds=Config.GLOBAL_ROUNDS,
-                                          epsilon_allocations=best_eps)
-        result["pareto_X"] = res.X
-        result["pareto_F"] = res.F
-        result["best_allocation"] = best_eps
-        result["n_pareto"] = len(res.X)
-        result["n_evaluations"] = prob.eval_count
-    else:
-        logger.warning("  [MOOP] NSGA-II returned empty Pareto — fallback to Fixed-eps(1.0)")
-        result = run_fixed_eps(trainer, 1.0, seed)
-        best_eps = {j: 1.0 for j in range(Config.N_CLIENTS)}
-        result["pareto_X"] = None
-        result["pareto_F"] = None
-        result["best_allocation"] = best_eps
+def select_front(X: np.ndarray, F: np.ndarray, G: np.ndarray):
+    """The one selection rule shared by every search, applied to the
+    complete archive of evaluated candidates:
+      * if any candidate satisfies all constraints, the non-dominated set of
+        the feasible candidates;
+      * otherwise the non-dominated set of the POP_SIZE candidates with the
+        smallest total constraint violation (feasibility-first ranking).
+    Returns (indices into the archive, number of feasible candidates)."""
+    from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+    cv = np.clip(np.asarray(G), 0, None).sum(axis=1)
+    feasible = cv <= 1e-12
+    pool_idx = (np.where(feasible)[0] if feasible.any()
+                else np.argsort(cv, kind="stable")[:Config.POP_SIZE])
+    nd = NonDominatedSorting().do(np.asarray(F)[pool_idx],
+                                  only_non_dominated_front=True)
+    return pool_idx[nd], int(feasible.sum())
 
-    try:
-        from pymoo.indicators.hv import HV
-        hv_ind = HV(ref_point=np.array([1.1, 0.5, 0.5]))
-        result["hv_per_gen"] = [
-            float(hv_ind(F[np.all(np.isfinite(F), axis=1)]))
-            for F in _genlog.gen_F]
-    except Exception:
-        result["hv_per_gen"] = None
-    result["method"] = "MOOP-HealthFL"
+
+def _train_selected(trainer: HealthcareFLTrainer, archive: Dict, seed: int,
+                    logger: Optional[logging.Logger] = None) -> Tuple[Dict, Dict]:
+    """Select a front from the archive (select_front), fully train its
+    best-compromise allocation. Returns (result, alloc)."""
+    X, F, G = archive["X"], archive["F"], archive["G"]
+    front_idx, n_feasible = select_front(X, F, G)
+    front_X, front_F = X[front_idx], F[front_idx]
+    if n_feasible == 0:
+        (logger or log).warning(
+            "  no candidate satisfies all constraints; selecting among the "
+            f"{Config.POP_SIZE} least-violating candidates")
+    best = _best_compromise(front_F)
+    best_eps = {j: float(front_X[best][j]) for j in range(Config.N_CLIENTS)}
+    trainer.reset(seed)
+    result = trainer.train_federated(num_rounds=Config.GLOBAL_ROUNDS,
+                                     epsilon_allocations=best_eps)
+    result["pareto_X"], result["pareto_F"] = front_X, front_F
+    result["n_pareto"] = int(len(front_X))
+    result["n_feasible"] = n_feasible
+    result["selection"] = "feasible" if n_feasible else "least_violation"
+    result["best_allocation"] = best_eps
     result["avg_epsilon"] = float(np.mean(list(best_eps.values())))
+    result["search_X"], result["search_F"], result["search_G"] = X, F, G
+    result["n_evaluations"] = int(len(X))
+    result["search_composition"] = search_composition(X, best_eps, seed)
+    return result, best_eps
+
+
+def search_composition(search_X, best_eps: Dict, seed: int) -> Dict:
+    """Privacy cost of the SEARCH itself, per client of the design cohort.
+
+    Every candidate evaluation is a DP training run on the same design
+    patients, so the runs compose. Reports
+      * design_cohort: epsilon after all EVAL_ROUNDS-round candidate runs --
+        the guarantee the design patients actually receive from this search;
+      * naive_workflow: the same plus one full training run of the selected
+        allocation -- what every training patient would receive if the
+        search and the final model shared one cohort (no design split).
+    """
+    trainer = HealthcareFLTrainer(_CTX["design_clients"], _CTX["X_val"],
+                                  _CTX["y_val"], seed=seed)
+    runs = [({j: float(x[j]) for j in range(Config.N_CLIENTS)}, Config.EVAL_ROUNDS)
+            for x in np.asarray(search_X)]
+    return {
+        "n_candidate_runs": len(runs),
+        "eval_rounds": Config.EVAL_ROUNDS,
+        "design_cohort": trainer.composed_epsilon(runs),
+        "naive_workflow": trainer.composed_epsilon(
+            runs + [(best_eps, Config.GLOBAL_ROUNDS)]),
+    }
+
+
+def run_mo_privacy(trainer: HealthcareFLTrainer, seed: int = 42,
+                   pool: Optional[Pool] = None) -> Dict:
+    """Two-objective ablation: NSGA-II over (privacy, utility) only."""
+    res, archive, _ = _run_nsga2(_mo_privacy_eval_worker, 2, 2, seed, pool)
+    result, _ = _train_selected(trainer, archive, seed)
+    result["method"] = "MO-Privacy"
     return result
 
 
-# ---------------------------------------------------------------------------
-# LHS random-search control (identical evaluation budget)
-# ---------------------------------------------------------------------------
+def run_moop_healthfl(trainer: HealthcareFLTrainer, seed: int = 42,
+                      pool: Optional[Pool] = None,
+                      logger: Optional[logging.Logger] = None) -> Dict:
+    """Full three-objective NSGA-II search (privacy, utility, fairness)."""
+    logger = logger or log
+    logger.info(f"  [MOOP] NSGA-II pop={Config.POP_SIZE}, "
+                f"gen={Config.N_GENERATIONS}, eval_rounds={Config.EVAL_ROUNDS}, "
+                f"workers={pool._processes if pool is not None else 1}")
+    res, archive, gen_F = _run_nsga2(_moop_eval_worker, 3, 3, seed, pool)
+    logger.info("  [MOOP] Running full training with best allocation...")
+    result, _ = _train_selected(trainer, archive, seed, logger)
+    from pymoo.indicators.hv import HV
+    hv_ind = HV(ref_point=HV_REF_POINT)
+    result["hv_per_gen"] = [float(hv_ind(F[np.all(np.isfinite(F), axis=1)]))
+                            for F in gen_F]
+    result["method"] = "MOOP-HealthFL"
+    return result
 
-def run_lhs_search(trainer: HealthcareFLTrainer, seed: int = 42,
-                   pool: Optional[Pool] = None,
-                   search_eval: Optional[tuple] = None,
-                   logger: logging.Logger = None) -> Dict:
-    """Latin-hypercube random search over the identical evaluation budget
-    (POP + (G-1)*OFFSPRING candidates), identical worker, identical
-    constraints — a search-strategy control for NSGA-II."""
-    if logger is None:
-        logger = log
-    cfg = _make_cfg()
-    if search_eval is not None:
-        X_search, y_search, eth_s, gen_s = search_eval
-    else:
-        raise ValueError("run_lhs_search requires search_eval in v5")
 
-    n_cand = Config.POP_SIZE + (Config.N_GENERATIONS - 1) * Config.N_OFFSPRINGS
+def lhs_candidates(n_cand: int, seed: int) -> np.ndarray:
+    """Latin-hypercube sample of n_cand allocations over the budget box."""
     K = Config.N_CLIENTS
     rng = np.random.default_rng(seed)
     strata = np.tile(np.arange(n_cand, dtype=float), (K, 1)).T
     for j in range(K):
         rng.shuffle(strata[:, j])
     u = (strata + rng.random((n_cand, K))) / n_cand
-    Xc = Config.EPSILON_MIN + u * (Config.EPSILON_MAX - Config.EPSILON_MIN)
+    return Config.EPSILON_MIN + u * (Config.EPSILON_MAX - Config.EPSILON_MIN)
+
+
+def run_lhs_search(trainer: HealthcareFLTrainer, seed: int = 42,
+                   pool: Optional[Pool] = None,
+                   logger: Optional[logging.Logger] = None) -> Dict:
+    """Latin-hypercube random search with the identical evaluation budget
+    (POP + (G-1)*OFFSPRING candidates), worker, constraints, and selection
+    rule -- the search-strategy control for NSGA-II."""
+    logger = logger or log
+    cfg = _make_cfg()
+    n_cand = Config.POP_SIZE + (Config.N_GENERATIONS - 1) * Config.N_OFFSPRINGS
+    Xc = lhs_candidates(n_cand, seed)
 
     logger.info(f"  [LHS] evaluating {n_cand} candidates "
                 f"(eval_rounds={Config.EVAL_ROUNDS})")
-    tasks = [(Xc[i], trainer.clients, X_search, y_search, eth_s, gen_s,
-              Config.EVAL_ROUNDS, seed, cfg) for i in range(n_cand)]
-    raw = (pool.map(_v3_moop_eval_worker, tasks) if pool is not None
-           else [_v3_moop_eval_worker(t) for t in tasks])
+    raw = _pool_map(pool, _moop_eval_worker,
+                    [(Xc[i], Config.EVAL_ROUNDS, seed, cfg)
+                     for i in range(n_cand)])
     F = np.array([r[0] for r in raw])
     G = np.array([r[1] for r in raw])
 
-    cv = np.clip(G, 0, None).sum(axis=1)
-    feasible = cv <= 1e-12
-    pool_idx = (np.where(feasible)[0] if feasible.any()
-                else np.argsort(cv)[:Config.POP_SIZE])
-    from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
-    nd = NonDominatedSorting().do(F[pool_idx], only_non_dominated_front=True)
-    front_idx = pool_idx[nd]
-    F_front = F[front_idx]
-    F_norm = F_front / (F_front.max(axis=0) + 1e-8)
-    best = front_idx[int(np.argmin(F_norm.sum(axis=1)))]
-    best_eps = {j: float(Xc[best, j]) for j in range(K)}
-
-    trainer.reset(seed)
-    result = trainer.train_federated(num_rounds=Config.GLOBAL_ROUNDS,
-                                     epsilon_allocations=best_eps)
-    try:
-        from pymoo.indicators.hv import HV
-        result["hv_final"] = float(
-            HV(ref_point=np.array([1.1, 0.5, 0.5]))(F_front))
-    except Exception:
-        result["hv_final"] = None
-    result["pareto_X"] = Xc[front_idx]
-    result["pareto_F"] = F_front
-    result["best_allocation"] = best_eps
-    result["n_pareto"] = int(len(front_idx))
-    result["n_evaluations"] = int(n_cand)
+    result, _ = _train_selected(trainer, {"X": Xc, "F": F, "G": G}, seed, logger)
+    from pymoo.indicators.hv import HV
+    result["hv_final"] = float(HV(ref_point=HV_REF_POINT)(
+        np.asarray(result["pareto_F"])))
     result["method"] = "LHS-Search"
-    result["avg_epsilon"] = float(np.mean(list(best_eps.values())))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Method registry, result finalisation, saved predictions
+# ---------------------------------------------------------------------------
+
+BASELINES = {
+    "fedavg":         ("FedAvg",          lambda t, s: run_fedavg(t, s)),
+    "fixed_eps_1.0":  ("Fixed-eps(1.0)",  lambda t, s: run_fixed_eps(t, 1.0, s)),
+    "fixed_eps_2.0":  ("Fixed-eps(2.0)",  lambda t, s: run_fixed_eps(t, 2.0, s)),
+    "fixed_eps_5.0":  ("Fixed-eps(5.0)",  lambda t, s: run_fixed_eps(t, 5.0, s)),
+    "fixed_eps_10.0": ("Fixed-eps(10.0)", lambda t, s: run_fixed_eps(t, 10.0, s)),
+    "fairfed":        ("FairFed",         lambda t, s: run_fairfed(t, s)),
+    "fcfl":           ("FCFL",            lambda t, s: run_fcfl(t, s)),
+}
+SEARCHES = {
+    "mo_privacy":    ("MO-Privacy",    lambda t, s, pool, lg: run_mo_privacy(t, s, pool)),
+    "lhs_search":    ("LHS-Search",    lambda t, s, pool, lg: run_lhs_search(t, s, pool, lg)),
+    "moop_healthfl": ("MOOP-HealthFL", lambda t, s, pool, lg: run_moop_healthfl(t, s, pool, lg)),
+}
+METHOD_ORDER = list(BASELINES) + list(SEARCHES)
+
+
+def _context_trainer(seed: int) -> "HealthcareFLTrainer":
+    c = _CTX
+    return HealthcareFLTrainer(c["clients"], c["X_test"], c["y_test"],
+                               seed=seed, X_val=c["X_val"], y_val=c["y_val"])
+
+
+def finalize_result(result: Dict, trainer: "HealthcareFLTrainer") -> Dict:
+    """Attach the five-level fairness evaluation (test split) and the
+    per-client privacy report to a trained method's result."""
+    m = result["final_metrics"]
+    clients = trainer.clients
+    if result.get("best_allocation"):
+        eps_alloc = result["best_allocation"]
+    elif result.get("avg_epsilon", float("inf")) != float("inf"):
+        eps_alloc = {c.client_id: result["avg_epsilon"] for c in clients}
+    else:
+        eps_alloc = None
+    fairness_eval = FairnessEvaluator(pd.DataFrame(
+        {"ethnicity": _CTX["eth_test"], "gender": _CTX["gen_test"]}))
+    result["fairness"] = fairness_eval.evaluate_all(
+        trainer.y_test.flatten().astype(int), m["predictions"],
+        m["prediction_probs"], trainer.X_test,
+        result.get("client_aucs", [0.5] * Config.N_CLIENTS),
+        eps_alloc, {c.client_id: c.n_samples for c in clients})
+    result["privacy"] = trainer.privacy_report(eps_alloc)
+    return result
+
+
+def _baseline_worker(args):
+    """Train one (method, seed) baseline end to end in a worker process."""
+    method_key, seed = args
+    trainer = _context_trainer(seed)
+    t0 = time.time()
+    result = BASELINES[method_key][1](trainer, seed)
+    result = finalize_result(result, trainer)
+    result["elapsed_s"] = time.time() - t0
+    return method_key, seed, result
+
+
+_ARRAY_KEYS = ("predictions", "prediction_probs", "val_probs",
+               "raw_val_probs", "raw_test_probs")
+
+
+def predictions_path(pred_dir: str, seed, method_key: str) -> str:
+    return os.path.join(pred_dir, f"seed{seed}_{method_key}.npz")
+
+
+def save_predictions(pred_dir: str, seed, method_key: str, result: Dict):
+    """Write a trained model's validation/test probabilities, threshold and
+    per-client mechanism parameters to <pred_dir>/seed<seed>_<method>.npz,
+    then drop the large arrays from the result (they do not belong in the
+    checkpoint). Rows align with eval_split.npz."""
+    m = result["final_metrics"]
+    rep = result["privacy"]
+    ids = sorted(rep)
+    arrays = {
+        "test_probs": np.asarray(m["prediction_probs"]).ravel(),
+        "val_probs": np.asarray(m["val_probs"]).ravel(),
+        "threshold": np.float64(m["threshold"]),
+        "client_ids": np.array(ids),
+    }
+    arrays["privacy_unit"] = np.array(rep[ids[0]]["privacy_unit"])
+    for field in ("epsilon", "sigma", "q", "total_steps", "n_local",
+                  "n_patients_local", "n_units"):
+        arrays[field] = np.array([rep[i][field] for i in ids], dtype=float)
+    for k in ("raw_val_probs", "raw_test_probs"):
+        if k in m:
+            arrays[k] = np.asarray(m[k]).ravel()
+    os.makedirs(pred_dir, exist_ok=True)
+    np.savez_compressed(predictions_path(pred_dir, seed, method_key), **arrays)
+    for k in _ARRAY_KEYS:
+        m.pop(k, None)
+
+
+def save_eval_split(pred_dir: str, fed: Dict):
+    """Labels and per-row metadata of the validation and test partitions
+    (aligned with every saved probability vector)."""
+    arrays = {"split_seed": np.int64(fed["split_seed"])}
+    for part in ("val", "test"):
+        arrays[f"{part}_y"] = fed[f"y_{part}"].astype(np.int8)
+        for col in fed[f"meta_{part}"].columns:
+            arrays[f"{part}_{col}"] = fed[f"meta_{part}"][col].values
+    os.makedirs(pred_dir, exist_ok=True)
+    np.savez_compressed(os.path.join(pred_dir, "eval_split.npz"), **arrays)
 
 
 # ---------------------------------------------------------------------------
@@ -1523,8 +1729,8 @@ def generate_figures(agg: Dict, all_results: Dict, figures_dir: str,
 
     COLORS = {
         "fedavg": "#1f77b4", "fixed_eps": "#ff7f0e",
-        "dpsgd": "#2ca02c", "fairfed": "#d62728", "fcfl": "#9467bd",
-        "mo_privacy": "#8c564b", "mo_efficiency": "#e377c2",
+        "fairfed": "#d62728", "fcfl": "#9467bd",
+        "mo_privacy": "#8c564b",
         "moop_healthfl": "#17becf",
     }
 
@@ -1723,205 +1929,134 @@ def print_latex_tables(agg: Dict):
 # Main experiment runner
 # ---------------------------------------------------------------------------
 
+CACHE_NAME = "mimic_iv_features_v2.parquet"   # retains subject_id
+
+
+def load_data(mimic_path: Optional[str], cache_file: str,
+              logger: logging.Logger) -> pd.DataFrame:
+    """Feature cache if present, else build it from raw MIMIC-IV, else fall
+    back to synthetic data (pipeline smoke tests only)."""
+    if os.path.exists(cache_file) or (mimic_path and os.path.exists(mimic_path)):
+        return load_mimic_data(mimic_path or "", cache_file, logger)
+    logger.warning("No feature cache and no MIMIC-IV path -- using SYNTHETIC "
+                   "data (smoke test only; results are meaningless).")
+    return generate_synthetic_data()
+
+
 def run_experiments(args, logger: logging.Logger):
     output_dir = args.output_dir
     checkpoint_dir = os.path.join(output_dir, "checkpoints")
     figures_dir = os.path.join(output_dir, "figures")
     results_dir = os.path.join(output_dir, "results")
-    for d in [output_dir, checkpoint_dir, figures_dir, results_dir]:
+    pred_dir = os.path.join(output_dir, "predictions")
+    for d in [output_dir, checkpoint_dir, figures_dir, results_dir, pred_dir]:
         os.makedirs(d, exist_ok=True)
 
     if args.fast:
         Config.apply_fast_mode()
         logger.info("FAST MODE enabled.")
-
     Config.N_JOBS = args.n_jobs
     if args.seed is not None:
         Config.SEEDS = [args.seed]
+    for arg, attr in [("privacy_unit", "PRIVACY_UNIT"),
+                      ("preprocessing", "PREPROCESSING"),
+                      ("class_weight", "CLASS_WEIGHT"),
+                      ("design_fraction", "DESIGN_FRACTION"),
+                      ("fairness_objective", "FAIRNESS_OBJECTIVE"),
+                      ("clip_norm", "CLIPPING_NORM"),
+                      ("dp_lr", "DP_LEARNING_RATE"),
+                      ("eval_rounds", "EVAL_ROUNDS")]:
+        if getattr(args, arg, None) is not None:
+            setattr(Config, attr, getattr(args, arg))
+    if getattr(args, "drop_features", None):
+        dpc.DROP_GROUPS = tuple(args.drop_features)
+        logger.info(f"ABLATION: model inputs without {dpc.DROP_GROUPS}")
+    methods = args.methods or METHOD_ORDER
+    unknown = [k for k in methods if k not in METHOD_ORDER]
+    if unknown:
+        raise SystemExit(f"Unknown method(s) {unknown}; choose from {METHOD_ORDER}")
 
     logger.info("=" * 70)
-    logger.info("MOOP-HealthFL v5 — certified DP-SGD (RDP accountant)")
-    logger.info(f"Seeds:          {Config.SEEDS}")
+    logger.info("MOOP-HealthFL -- certified DP-SGD (RDP accountant)")
+    logger.info(f"Seeds:          {Config.SEEDS} (data split seed {args.split_seed})")
+    logger.info(f"Privacy:        unit={Config.PRIVACY_UNIT}, "
+                f"preprocessing={Config.PREPROCESSING}, "
+                f"class weight={Config.CLASS_WEIGHT}, "
+                f"design fraction={Config.DESIGN_FRACTION}")
+    logger.info(f"DP training:    C={Config.CLIPPING_NORM}, lot={Config.BATCH_SIZE}, "
+                f"lr={Config.DP_LEARNING_RATE} (non-private lr={Config.LEARNING_RATE})")
+    logger.info(f"Search:         fairness objective={Config.FAIRNESS_OBJECTIVE}, "
+                f"constraints sens>={Config.SENSITIVITY_MIN}, "
+                f"AUROC>={Config.AUC_MIN}, FNR gap<={Config.FAIRNESS_GAP_MAX} "
+                f"(cross-fitted on validation)")
     logger.info(f"Global rounds:  {Config.GLOBAL_ROUNDS}")
     logger.info(f"NSGA-II:        pop={Config.POP_SIZE}, gen={Config.N_GENERATIONS}, "
                 f"eval_rounds={Config.EVAL_ROUNDS}")
     logger.info(f"Workers:        {Config.N_JOBS}")
     logger.info("=" * 70)
 
-    # Data
-    if args.mimic_path and os.path.exists(args.mimic_path):
-        cache_file = os.path.join(output_dir, "mimic_iv_features_v2.parquet")  # retains subject_id
-        data = load_mimic_data(args.mimic_path, cache_file, logger)
-    else:
-        logger.warning("MIMIC-IV path not found — using synthetic data.")
-        data = generate_synthetic_data()
-
+    cache_file = args.cache_file or os.path.join(output_dir, CACHE_NAME)
+    data = load_data(args.mimic_path, cache_file, logger)
     logger.info(f"Dataset: {len(data):,} stays, mortality={data['mortality'].mean():.1%}")
 
-    # Impute NaN in ALL feature columns before scaling.
-    # MIMIC-IV merges can leave NaN in demographic columns (age, gender, etc.)
-    # even after clinical-column imputation in load_mimic_data.
-    na_count = data[Config.FEATURE_COLS].isnull().sum().sum()
-    if na_count > 0:
-        for col in Config.FEATURE_COLS:
-            median_val = data[col].median()
-            data[col] = data[col].fillna(median_val)
-        logger.warning(f"Imputed {na_count} NaN values across feature columns.")
-
-    # ------------------------------------------------------------------
-    # v5 protocol: patient-level split; each PATIENT assigned to exactly
-    # one client (modal care unit of their training stays); one-hot
-    # encoding (19 features); continuous features standardized with a
-    # train-partition-only scaler; validation split for search fitness
-    # and threshold selection.
-    # ------------------------------------------------------------------
-    from sklearn.preprocessing import StandardScaler
-
-    if "subject_id" not in data.columns:
-        logger.warning("subject_id missing (old cache?): treating each stay "
-                       "as its own subject.")
-        data = data.copy()
-        data["subject_id"] = np.arange(len(data))
-
-    subjects = np.sort(data["subject_id"].unique())
-    rng_split = np.random.RandomState(42)
-    perm = rng_split.permutation(len(subjects))
-    n_test = int(round(Config.TEST_SIZE * len(subjects)))
-    n_val = int(round(Config.VAL_SIZE * len(subjects)))
-    test_subjects = set(subjects[perm[:n_test]])
-    val_subjects = set(subjects[perm[n_test:n_test + n_val]])
-
-    part = np.where(data["subject_id"].isin(test_subjects), "test",
-                    np.where(data["subject_id"].isin(val_subjects), "val", "train"))
-    data = data.assign(_partition=part)
-
-    train_rows = data[data["_partition"] == "train"].copy()
-
-    # Patient -> single client: modal care-unit client over the patient's
-    # training stays (ties broken by pandas value_counts order).
-    modal = (train_rows.groupby("subject_id")["hospital_id"]
-             .agg(lambda s: s.value_counts().index[0]))
-    train_rows["client_id"] = train_rows["subject_id"].map(modal).astype(int)
-    moved = int((train_rows["client_id"] != train_rows["hospital_id"]).sum())
-    multi = int((train_rows.groupby("subject_id")["hospital_id"]
-                 .nunique() > 1).sum())
-    max_stays = int(train_rows.groupby(["client_id", "subject_id"])
-                    .size().max())
-    logger.info(f"Patient->client assignment: {multi:,} multi-unit patients; "
-                f"{moved:,} stays reassigned "
-                f"({100 * moved / len(train_rows):.1f}%); max stays/patient "
-                f"within a client: {max_stays} (group-privacy factor)")
-
-    scaler = StandardScaler()
-    X_train_raw, feature_names, _ = dpc.encode_features(train_rows)
-    scaler.fit(X_train_raw[:, :dpc.N_CONTINUOUS])
-
-    clients = []
-    for i in sorted(train_rows["client_id"].unique())[:Config.N_CLIENTS]:
-        cdf = train_rows[train_rows["client_id"] == i]
-        c = FederatedClient(int(i), cdf.reset_index(drop=True), scaler)
-        clients.append(c)
-        logger.info(f"  Client {i}: {c.n_samples:,} train stays "
-                    f"({cdf['subject_id'].nunique():,} patients), "
-                    f"mortality={c.mortality_rate:.1%}")
-
-    def _extract(partition: str):
-        pdf = data[data["_partition"] == partition]
-        X, _, _ = dpc.encode_features(pdf)
-        nan_mask = np.isnan(X)
-        if nan_mask.any():
-            col_med = np.nanmedian(X, axis=0)
-            X[nan_mask] = np.take(col_med, np.where(nan_mask)[1])
-        X[:, :dpc.N_CONTINUOUS] = scaler.transform(X[:, :dpc.N_CONTINUOUS])
-        y = pdf["mortality"].values.astype(np.float32)
-        return X.astype(np.float32), y, pdf["ethnicity"].values, pdf["gender"].values
-
-    X_val, y_val, eth_va, gen_va = _extract("val")
-    X_test, y_test, eth_te, gen_te = _extract("test")
-    search_eval = (X_val, y_val, eth_va, gen_va)
-
-    test_demographics = pd.DataFrame({"ethnicity": eth_te, "gender": gen_te})
-    fairness_eval = FairnessEvaluator(test_demographics)
-    logger.info(f"Patient-level split -- train: {len(train_rows):,} stays, "
-                f"val: {len(y_val):,} stays, test: {len(y_test):,} stays "
-                f"({len(subjects):,} subjects); "
-                f"{dpc.N_FEATURES} one-hot features")
+    fed = prepare_federation(data, split_seed=args.split_seed, logger=logger)
+    save_eval_split(pred_dir, fed)
+    with open(os.path.join(results_dir, "run_config.json"), "w") as f:
+        json.dump({**_config_snapshot(), "split_seed": args.split_seed,
+                   "methods": methods}, f, indent=2, default=str)
 
     ckpt = CheckpointManager(checkpoint_dir)
     all_results = ckpt.load() or {}
+    for seed in Config.SEEDS:
+        all_results.setdefault(str(seed), {})
 
-    pool_ctx = Pool(Config.N_JOBS) if Config.N_JOBS > 1 else None
-    logger.info(f"Pool: {'%d workers' % Config.N_JOBS if pool_ctx else 'sequential'}")
+    def _done(seed, key) -> bool:
+        r = all_results[str(seed)].get(key)
+        return (r is not None and "error" not in r
+                and os.path.exists(predictions_path(pred_dir, seed, key)))
 
-    METHODS = [
-        ("fedavg",         "FedAvg",          lambda t, s: run_fedavg(t, s)),
-        ("fixed_eps_1.0",  "Fixed-eps(1.0)",  lambda t, s: run_fixed_eps(t, 1.0, s)),
-        ("fixed_eps_2.0",  "Fixed-eps(2.0)",  lambda t, s: run_fixed_eps(t, 2.0, s)),
-        ("fixed_eps_5.0",  "Fixed-eps(5.0)",  lambda t, s: run_fixed_eps(t, 5.0, s)),
-        ("fixed_eps_10.0", "Fixed-eps(10.0)", lambda t, s: run_fixed_eps(t, 10.0, s)),
-        ("fairfed",        "FairFed",         lambda t, s: run_fairfed(t, s)),
-        ("fcfl",           "FCFL",            lambda t, s: run_fcfl(t, s)),
-        ("mo_privacy",     "MO-Privacy",      lambda t, s: run_mo_privacy(t, s, pool=pool_ctx, search_eval=search_eval)),
-        ("lhs_search",     "LHS-Search",      lambda t, s: run_lhs_search(t, s, pool=pool_ctx, search_eval=search_eval, logger=logger)),
-        ("moop_healthfl",  "MOOP-HealthFL",   lambda t, s: run_moop_healthfl(
-            t, fairness_eval, s, pool=pool_ctx, logger=logger,
-            search_eval=search_eval)),
-    ]
+    def _store(seed, key, name, result):
+        m = result["final_metrics"]
+        logger.info(f"  [seed {seed}] [{name}] {result.get('elapsed_s', 0):.0f}s -- "
+                    f"AUC={m['auc']:.4f}, Sens={m['sensitivity']:.3f}, "
+                    f"Fair={result['fairness']['fairness_unified']:.3f}")
+        save_predictions(pred_dir, seed, key, result)
+        all_results[str(seed)][key] = result
+        ckpt.save(all_results)
 
+    pool = make_pool(make_context(fed), Config.N_JOBS)
+    logger.info(f"Pool: {'%d workers' % Config.N_JOBS if pool else 'sequential'}")
+    t_start = time.time()
     try:
+        # Baselines: one worker per (method, seed), all seeds at once.
+        tasks = [(k, s) for s in Config.SEEDS for k in BASELINES
+                 if k in methods and not _done(s, k)]
+        if tasks:
+            logger.info(f"\nRunning {len(tasks)} baseline (method, seed) runs...")
+            done_iter = (pool.imap_unordered(_baseline_worker, tasks, chunksize=1)
+                         if pool is not None else map(_baseline_worker, tasks))
+            for key, seed, result in done_iter:
+                _store(seed, key, BASELINES[key][0], result)
+
+        # Searches: one at a time, each using the whole pool for candidates.
         for seed in Config.SEEDS:
-            sk = str(seed)
-            if sk not in all_results:
-                all_results[sk] = {}
-
-            logger.info(f"\n{'='*70}\nSEED {seed}\n{'='*70}")
-            trainer = HealthcareFLTrainer(clients, X_test, y_test, seed=seed,
-                                          X_val=X_val, y_val=y_val)
-            client_sizes = {c.client_id: c.n_samples for c in clients}
-
-            for method_key, method_name, method_fn in METHODS:
-                if method_key in all_results[sk]:
-                    logger.info(f"  [{method_name}] already done — skipping.")
+            for key, (name, fn) in SEARCHES.items():
+                if key not in methods:
                     continue
-
-                logger.info(f"\n  Running [{method_name}]...")
+                if _done(seed, key):
+                    logger.info(f"  [seed {seed}] [{name}] already done -- skipping.")
+                    continue
+                logger.info(f"\n  [seed {seed}] Running [{name}]...")
+                trainer = _context_trainer(seed)
                 t0 = time.time()
-                try:
-                    result = method_fn(trainer, seed)
-                    elapsed = time.time() - t0
-
-                    # Compute 5-level fairness
-                    m = result["final_metrics"]
-                    y_true = y_test.flatten().astype(int)
-                    eps_alloc = result.get("best_allocation") or (
-                        {c.client_id: result.get("avg_epsilon", 1.0) for c in clients}
-                        if result.get("avg_epsilon", float("inf")) != float("inf")
-                        else None
-                    )
-                    result["fairness"] = fairness_eval.evaluate_all(
-                        y_true, m["predictions"], m["prediction_probs"],
-                        X_test, result.get("client_aucs", [0.5] * Config.N_CLIENTS),
-                        eps_alloc, client_sizes,
-                    )
-
-                    all_results[sk][method_key] = result
-                    ckpt.save(all_results)
-
-                    auc = m.get("auc", 0.0)
-                    sens = m.get("sensitivity", 0.0)
-                    fair = result["fairness"]["fairness_unified"]
-                    logger.info(f"  [{method_name}] {elapsed:.0f}s — "
-                                f"AUC={auc:.4f}, Sens={sens:.3f}, Fair={fair:.3f}")
-                except Exception as exc:
-                    logger.error(f"  [{method_name}] FAILED: {exc}", exc_info=True)
-                    all_results[sk][method_key] = {"method": method_name, "error": str(exc),
-                                                    "final_metrics": {}, "fairness": {}}
-                    ckpt.save(all_results)
-
+                result = finalize_result(fn(trainer, seed, pool, logger), trainer)
+                result["elapsed_s"] = time.time() - t0
+                _store(seed, key, name, result)
     finally:
-        if pool_ctx is not None:
-            pool_ctx.close()
-            pool_ctx.join()
+        if pool is not None:
+            pool.close()
+            pool.join()
+    logger.info(f"All methods finished in {(time.time() - t_start) / 60:.1f} min.")
 
     # Aggregate
     logger.info("\n" + "=" * 70)
@@ -1943,17 +2078,14 @@ def run_experiments(args, logger: logging.Logger):
         json.dump(agg_json, f, indent=2, default=str)
     logger.info(f"Results saved to {json_path}")
 
-    # Print table
     print_latex_tables(agg)
 
-    # Figures
     logger.info("\nGenerating figures...")
     try:
         generate_figures(agg, all_results, figures_dir, results_dir, logger)
     except Exception as exc:
         logger.warning(f"Figure generation failed: {exc}")
 
-    # Summary
     logger.info("\n" + "=" * 70)
     logger.info("SUMMARY")
     logger.info("=" * 70)
@@ -1963,9 +2095,8 @@ def run_experiments(args, logger: logging.Logger):
                     f"Sens={m['sensitivity'][0]:.3f}±{m['sensitivity'][1]:.3f}, "
                     f"Fair={m['fairness_unified'][0]:.3f}±{m['fairness_unified'][1]:.3f}, "
                     f"ε={m['avg_epsilon']:.2f}")
-    n_figs = len([f for f in os.listdir(figures_dir) if f.endswith(".pdf")])
-    logger.info(f"Figures: {n_figs} PDFs saved to {figures_dir}")
-    logger.info(f"Results: {results_dir}")
+    logger.info(f"Predictions: {pred_dir}")
+    logger.info(f"Results:     {results_dir}")
     logger.info("\nAll done.")
     return agg
 
@@ -1975,18 +2106,51 @@ def run_experiments(args, logger: logging.Logger):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="MOOP-HealthFL v3 Parallel")
+    parser = argparse.ArgumentParser(description="MOOP-HealthFL experiment runner")
     parser.add_argument("--fast", action="store_true",
                         help="Fast mode (pop=20, gen=30, eval_rounds=10, seed=42 only)")
     parser.add_argument("--n-jobs", type=int,
                         default=max(1, (os.cpu_count() or 2) - 1),
-                        help="Parallel workers for NSGA-II (default: cpu_count - 1)")
+                        help="Worker processes (default: cpu_count - 1)")
     parser.add_argument("--mimic-path", type=str, default=None,
-                        help="Path to MIMIC-IV directory (optional; synthetic fallback if absent)")
+                        help="MIMIC-IV directory (needed only to build the feature cache)")
+    parser.add_argument("--cache-file", type=str, default=None,
+                        help=f"Feature cache (default: <output-dir>/{CACHE_NAME})")
     parser.add_argument("--output-dir", type=str, default="output",
                         help="Output directory")
     parser.add_argument("--seed", type=int, default=None,
-                        help="Run a single seed (default: all seeds)")
+                        help="Run a single training seed (default: all seeds)")
+    parser.add_argument("--split-seed", type=int, default=42,
+                        help="Seed of the patient-level train/val/test split")
+    parser.add_argument("--privacy-unit", choices=["patient", "record"], default=None,
+                        help="DP adjacency (default: patient)")
+    parser.add_argument("--preprocessing", choices=["reference", "cohort"], default=None,
+                        help="reference = public constants (default); cohort = "
+                             "fitted statistics of the original submission (ablation)")
+    parser.add_argument("--class-weight", choices=["prior", "pooled"], default=None,
+                        help="prior = public mortality prior (default); pooled = "
+                             "training labels (ablation)")
+    parser.add_argument("--design-fraction", type=float, default=None,
+                        help="Share of training patients reserved for budget "
+                             "search (default 0.25; 0 = search on the training cohort)")
+    parser.add_argument("--fairness-objective", choices=["five_level", "three_level", "fnr_gap"],
+                        default=None,
+                        help="Fairness objective of the search (default five_level)")
+    parser.add_argument("--clip-norm", type=float, default=None,
+                        help="DP clipping norm C (default: Config.CLIPPING_NORM)")
+    parser.add_argument("--dp-lr", type=float, default=None,
+                        help="Learning rate of certified training "
+                             "(default: Config.DP_LEARNING_RATE)")
+    parser.add_argument("--eval-rounds", type=int, default=None,
+                        help="Federated rounds per search candidate (default: "
+                             "Config.EVAL_ROUNDS; set to the full round count "
+                             "for a full-fidelity search)")
+    parser.add_argument("--drop-features", nargs="+", default=None,
+                        choices=["ethnicity", "gender", "insurance"],
+                        help="Ablation: remove these demographic indicator "
+                             "groups from the model inputs")
+    parser.add_argument("--methods", nargs="+", default=None,
+                        help=f"Subset of methods to run (default: all of {METHOD_ORDER})")
     args = parser.parse_args()
 
     log_dir = os.path.join(args.output_dir, "logs")

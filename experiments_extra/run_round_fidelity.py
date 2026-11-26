@@ -10,7 +10,6 @@ High correlation => the 15-round proxy preserves the ranking that a full
 50-round evaluation would produce.
 
 Usage:
-    cd moop-healthfl-release
     python3 experiments_extra/run_round_fidelity.py [--n-candidates 12]
 """
 
@@ -20,7 +19,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common_setup import (m, dpc, build_federation, save_json, SEEDS)  # noqa: E402
+from common_setup import (m, build_federation, save_json, SEEDS)  # noqa: E402
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                    "results", "round_fidelity_results.json")
@@ -57,18 +56,12 @@ def main():
     args = ap.parse_args()
 
     K = m.Config.N_CLIENTS
-    lo, hi = m.Config.EPSILON_MIN, m.Config.EPSILON_MAX
     results = {}
     for seed in args.seeds:
         _, trainer, fairness_eval, _ = build_federation(
             cache_file=args.cache_file, seed=seed)
-        rng = np.random.default_rng(seed)
         # LHS candidates across the budget hypercube
-        strata = np.tile(np.arange(args.n_candidates, dtype=float), (K, 1)).T
-        for j in range(K):
-            rng.shuffle(strata[:, j])
-        u = (strata + rng.random((args.n_candidates, K))) / args.n_candidates
-        cands = lo + u * (hi - lo)
+        cands = m.lhs_candidates(args.n_candidates, seed)
 
         rows15, rows50 = [], []
         for i, xi in enumerate(cands):

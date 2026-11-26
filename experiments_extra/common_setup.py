@@ -1,19 +1,11 @@
 """
-Shared setup for the post-review evaluation harnesses — v5 CERTIFIED-DP PROTOCOL.
+Shared setup for the complementary evaluation harnesses.
 
-Rebuilds the exact experimental environment of
-moop_healthfl.py (output_v5_real/):
-
-  - patient-level 70/10/20 split, RandomState(42);
-  - each PATIENT assigned to exactly one client (modal care unit of their
-    training stays) -> no cross-client patient overlap;
-  - one-hot encoding (19 features); continuous features standardized with a
-    training-partition-only scaler;
-  - certified DP-SGD (per-example clipping + RDP accountant) via the v5
-    module; epsilon_k are TOTAL-training budgets in [1, 10].
-
-Also provides a PATIENT-CLUSTERED bootstrap (resample subject_id, keep all
-their stays) for honest CIs and paired method comparisons.
+Rebuilds the exact federation of the main experiment through
+moop_healthfl.prepare_federation (the single implementation of the split,
+imputation, patient->client assignment and scaling), and provides a
+PATIENT-CLUSTERED bootstrap (resample subject_id, keep all their stays) for
+confidence intervals and paired method comparisons.
 """
 
 import os
@@ -28,14 +20,7 @@ sys.path.insert(0, CODE_DIR)
 import moop_healthfl as m  # noqa: E402
 import dp_core_v5 as dpc                    # noqa: E402
 
-DEFAULT_CACHE = os.path.join(
-    CODE_DIR, "output", "mimic_iv_features_v2.parquet")
-# Fall back to the v4 cache (identical features + subject_id) if v5 not yet run.
-_V4_CACHE = os.path.join(CODE_DIR, "output_v4_real", "mimic_iv_features_v2.parquet")
-
-# v5 seed-42 best-compromise TOTAL-budget allocation.
-# Placeholder until the v5 run completes; update_from_v5() overwrites it.
-MOOP_ALLOCATION_SEED42 = None
+DEFAULT_CACHE = os.path.join(CODE_DIR, "output", m.CACHE_NAME)
 
 SEEDS = [42, 123, 456]
 
@@ -45,86 +30,62 @@ def _resolve_cache(cache_file):
         return cache_file
     if os.path.exists(DEFAULT_CACHE):
         return DEFAULT_CACHE
-    if os.path.exists(_V4_CACHE):
-        return _V4_CACHE
     raise FileNotFoundError(
         "No feature cache found. Run moop_healthfl.py once "
         "with --mimic-path, or pass --cache-file.")
 
 
 def load_v5_allocation():
-    """Read the v5 seed-42 best-compromise allocation from the checkpoint."""
+    """Read the seed-42 selected MOOP allocation of the main run (split 42).
+    The run folder is $MOOP_RUN_DIR if set, else the second master rerun
+    (output_master_r2/split42), else the single-run default (output)."""
     import pickle
-    ckpt = os.path.join(CODE_DIR, "output", "checkpoints",
-                        "experiment_results.pkl")
-    if not os.path.exists(ckpt):
+    candidates = [os.environ.get("MOOP_RUN_DIR"),
+                  os.path.join(CODE_DIR, "output_master_r2", "split42"),
+                  os.path.join(CODE_DIR, "output")]
+    ckpt = None
+    for c in candidates:
+        if c and os.path.exists(os.path.join(c, "checkpoints",
+                                             "experiment_results.pkl")):
+            ckpt = os.path.join(c, "checkpoints", "experiment_results.pkl")
+            break
+    if ckpt is None:
         raise FileNotFoundError(
-            f"v5 checkpoint not found ({ckpt}); run the main v5 experiment "
-            "before the harnesses so the published allocation exists.")
-    d = pickle.load(open(ckpt, "rb"))
-    alloc = d["42"]["moop_healthfl"]["best_allocation"]
+            "no main-run checkpoint found (looked in $MOOP_RUN_DIR, "
+            "output_master_r2/split42, output); run the main experiment "
+            "before the harnesses so the selected allocation exists.")
+    with open(ckpt, "rb") as f:
+        d = pickle.load(f)
+    try:
+        alloc = d["42"]["moop_healthfl"]["best_allocation"]
+    except KeyError:
+        raise FileNotFoundError(
+            f"{ckpt} has no seed-42 MOOP-HealthFL result yet; finish the "
+            "main experiment before running the harnesses.") from None
+    print(f"[alloc] MOOP allocation from {ckpt}")
     return {int(k): float(v) for k, v in alloc.items()}
 
 
-def build_federation(cache_file: str = None, seed: int = 42):
-    """Recreate clients, trainer, test set and fairness evaluator, matching
-    moop_healthfl.run_experiments exactly. Returns
+def build_federation(cache_file: str = None, seed: int = 42,
+                     split_seed: int = 42, split_unit: str = "patient"):
+    """Recreate clients, trainer, test set and fairness evaluator exactly as
+    in moop_healthfl.run_experiments (deployment cohort; privacy unit,
+    preprocessing and design fraction as set in moop_healthfl.Config). Returns
     (clients, trainer, fairness_eval, test_demographics). trainer carries
-    X_val/y_val (used for the uniform threshold rule) and each client's
-    subject ids."""
-    from sklearn.preprocessing import StandardScaler
-
-    cache_file = _resolve_cache(cache_file)
-    data = pd.read_parquet(cache_file)
+    X_val/y_val (used for the uniform threshold rule); test_demographics
+    holds ethnicity, gender and subject_id per test row."""
+    data = pd.read_parquet(_resolve_cache(cache_file))
     if "subject_id" not in data.columns:
-        raise ValueError(f"{cache_file} has no subject_id column (v3 cache?).")
-
-    subjects = np.sort(data["subject_id"].unique())
-    rng_split = np.random.RandomState(42)
-    perm = rng_split.permutation(len(subjects))
-    n_test = int(round(m.Config.TEST_SIZE * len(subjects)))
-    n_val = int(round(m.Config.VAL_SIZE * len(subjects)))
-    test_subjects = set(subjects[perm[:n_test]])
-    val_subjects = set(subjects[perm[n_test:n_test + n_val]])
-    part = np.where(data["subject_id"].isin(test_subjects), "test",
-                    np.where(data["subject_id"].isin(val_subjects), "val", "train"))
-    data = data.assign(_partition=part)
-
-    train_rows = data[data["_partition"] == "train"].copy()
-    modal = (train_rows.groupby("subject_id")["hospital_id"]
-             .agg(lambda s: s.value_counts().index[0]))
-    train_rows["client_id"] = train_rows["subject_id"].map(modal).astype(int)
-
-    scaler = StandardScaler()
-    Xtr, _, _ = dpc.encode_features(train_rows)
-    scaler.fit(Xtr[:, :dpc.N_CONTINUOUS])
-
-    clients = []
-    for i in sorted(train_rows["client_id"].unique())[:m.Config.N_CLIENTS]:
-        cdf = train_rows[train_rows["client_id"] == i]
-        clients.append(m.FederatedClient(int(i), cdf.reset_index(drop=True), scaler))
-
-    def _extract(partition):
-        pdf = data[data["_partition"] == partition]
-        X, _, _ = dpc.encode_features(pdf)
-        nan = np.isnan(X)
-        if nan.any():
-            med = np.nanmedian(X, axis=0)
-            X[nan] = np.take(med, np.where(nan)[1])
-        X[:, :dpc.N_CONTINUOUS] = scaler.transform(X[:, :dpc.N_CONTINUOUS])
-        return (X.astype(np.float32), pdf["mortality"].values.astype(np.float32),
-                pdf["ethnicity"].values, pdf["gender"].values,
-                pdf["subject_id"].values)
-
-    Xv, yv, ethv, genv, subv = _extract("val")
-    Xt, yt, etht, gent, subt = _extract("test")
-
-    test_demographics = pd.DataFrame({"ethnicity": etht, "gender": gent,
-                                      "subject_id": subt})
+        raise ValueError("feature cache has no subject_id column.")
+    fed = m.prepare_federation(data, split_seed=split_seed,
+                               split_unit=split_unit)
+    test_demographics = fed["meta_test"][["ethnicity", "gender", "subject_id"]]
     fairness_eval = m.FairnessEvaluator(test_demographics)
-    trainer = m.HealthcareFLTrainer(clients, Xt, yt, seed=seed, X_val=Xv, y_val=yv)
-    trainer._test_subjects = subt
-    return clients, trainer, fairness_eval, test_demographics
+    trainer = m.HealthcareFLTrainer(fed["clients"], fed["X_test"], fed["y_test"],
+                                    seed=seed, X_val=fed["X_val"],
+                                    y_val=fed["y_val"])
+    trainer._test_subjects = test_demographics["subject_id"].values
+    return fed["clients"], trainer, fairness_eval, test_demographics
 
 
 def method_registry(alloc=None):
