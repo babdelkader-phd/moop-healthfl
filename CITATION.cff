@@ -3,6 +3,6 @@ message: "to be updated once submission accepted : If you use this software, ple
 authors:
 - names: Abdelkader BOUAZZA, Mohcine KODAD, Mostafa AZIZI
 orcid: https://orcid.org/0009-0002-7321-7297
-title: Certified differential privacy in clinical federated learning: rigorous evaluation and multi-objective privacy-budget selection
+title: Certified differential privacy in clinical federated learning rigorous evaluation and multi-objective privacy-budget selection
 version: 1.1.0
 date-released: 2026-07-31
