@@ -1,8 +1,15 @@
 cff-version: 1.1.0
 message: "to be updated once submission accepted : If you use this software, please cite it as below."
 authors:
-- names: Abdelkader BOUAZZA, Mohcine KODAD, Mostafa AZIZI
-orcid: https://orcid.org/0009-0002-7321-7297
+ - family-names: "BOUAZZA"
+   given-names: "Abdelkader"
+   orcid: https://orcid.org/0009-0002-7321-7297
+ - family-names: "KODAD"
+   given-names: "Mohcine"
+   orcid: https://orcid.org/0000-0002-9128-1519
+ - family-names: "AZIZI"
+   given-names: "Mostafa"
+   orcid: https://orcid.org/0000-0001-9936-3001
 title: Certified differential privacy in clinical federated learning rigorous evaluation and multi-objective privacy-budget selection
 version: 1.1.0
 date-released: 2026-07-31
